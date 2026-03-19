@@ -6,14 +6,16 @@
     When run, the script will interactively prompt for all required input  -- 
     no pre-configuration needed. The following steps are performed for each host:
 
-      1. Connect to the ESXi host using the root account
-      2. Ensure NTP servers are configured and the NTP service is running
-      3. Apply the required SDDC Manager advanced setting (allowSelfSigned)
-      4. Check if the certificate CN matches the host FQDN; if not, enable
+      1. Validate DNS  --  forward (A record) and reverse (PTR) lookup
+      2. Connect to the ESXi host using the root account
+      3. Ensure NTP servers are configured and the NTP service is running
+      4. Apply the required SDDC Manager advanced setting (allowSelfSigned)
+      5. Apply any enabled optional advanced settings
+      6. Check if the certificate CN matches the host FQDN; if not, enable
          SSH temporarily, regenerate the certificate via
          /sbin/generate-certificates, disable SSH again, then reboot and
          wait for the host to return online
-      5. Optionally reset the root account password (asked interactively)
+      7. Optionally reset the root account password (asked interactively)
 
     After all hosts are processed, an HTML report is generated in the same
     folder as the script containing the SHA-256 SSL thumbprint for each host,
@@ -114,10 +116,10 @@
 
 .NOTES
     Script  : HostPrep.ps1
-    Version : 3.3.1
+    Version : 3.4.0
     Author  : Paul van Dieen
     Blog    : https://www.hollebollevsan.nl
-    Date    : 2026-03-09
+    Date    : 2026-03-19
 
     Changelog:
         1.0.0 - Initial release
@@ -176,22 +178,29 @@
                 added -WhatIfReport switch; HTML report gains clipboard copy
                 button, cert expiry column with amber/red highlighting, and
                 Optional Settings column; Expiry stored in $hostResult
-        3.3.1 - Fixed thumbprint format: was colon-separated hex (XX:XX:...),
-                now SHA256:<base64> to match the SDDC Manager commissioning
-                UI exactly; updated HTML report header, column label, and
-                note text accordingly and surfaces a
-                clear error in $hostResult.Error instead of polluting
-                CertRegen with the exception message; a prominent red
-                banner is printed immediately on timeout; finally block
+        3.2.0 - Fixed $summaryWidth undefined; WhatIfReport overallOk logic
+                corrected; CertRegen 'OK' in WhatIfReport now shows
+                'Not needed'; removed dead-code hostOnline check;
+                password reset Y/N prompt skipped during WhatIfReport;
+                Posh-SSH warning suppressed during WhatIfReport
+        3.3.0 - Reboot timeout sets Rebooted='Timeout' and surfaces a clear
+                error in $hostResult.Error instead of CertRegen; prominent
+                red banner printed immediately on timeout; finally block
                 skips Disconnect-VIServer when host never came back to
-                avoid the noisy ObjectNotFound error; Timeout added to
-                Get-CellColor (red), HTML report Rebooted cell, and legend
-                WhatIfReport overallOk logic corrected (NTP/AdvancedSettings
-                are Skipped so status now shows correct checkmark); CertRegen
-                'OK' in WhatIfReport now shows 'Not needed' not 'Regenerated';
-                removed dead-code hostOnline check (Wait-ESXiHostOnline already
-                throws on timeout); password reset Y/N prompt skipped during
-                WhatIfReport; Posh-SSH warning suppressed during WhatIfReport
+                avoid noisy ObjectNotFound error; Timeout added to colour
+                table, HTML report Rebooted cell, and legend
+        3.3.1 - Fixed thumbprint format from colon-separated hex (XX:XX:...)
+                to SHA256:<base64> to match the SDDC Manager commissioning
+                UI exactly; HTML report header, column label, and note text
+                updated accordingly; UTF-8 BOM added to fix Windows
+                PowerShell encoding issues; em-dashes replaced with ASCII;
+                Write-ColorSummaryTable and Write-HtmlReport moved before
+                executable code to fix parse errors on all PS versions
+        3.4.0 - Added Test-DNSResolution helper: forward A record and
+                reverse PTR check per host before connect; DNS column added
+                to summary table and HTML report; WARN for PTR mismatch or
+                missing PTR, FAILED for no A record at all; DNS issues flag
+                action required but do not block remaining steps
 #>
 
 [CmdletBinding()]
@@ -217,10 +226,10 @@ param (
 
 $ScriptMeta = @{
     Name    = "HostPrep.ps1"
-    Version = "3.3.1"
+    Version = "3.4.0"
     Author  = "Paul van Dieen"
     Blog    = "https://www.hollebollevsan.nl"
-    Date    = "2026-03-09"
+    Date    = "2026-03-19"
 }
 
 #endregion
@@ -300,6 +309,7 @@ Write-Host ""
 
 if ($DryRun) {
     Write-Host "  *** DRY RUN MODE - No changes will be made ***" -ForegroundColor Yellow
+    Write-Host ("  " + $ScriptMeta.Blog) -ForegroundColor DarkGray
     Write-Host ""
 }
 
@@ -307,6 +317,7 @@ if ($WhatIfReport) {
     Write-Host "  *** WHATIF REPORT MODE - Thumbprint collection only ***" -ForegroundColor Cyan
     Write-Host "  Connects to each host, reads certificate thumbprint and expiry," -ForegroundColor DarkGray
     Write-Host "  then generates the HTML report. No changes will be made." -ForegroundColor DarkGray
+    Write-Host ("  " + $ScriptMeta.Blog) -ForegroundColor DarkGray
     Write-Host ""
 }
 
@@ -440,7 +451,7 @@ function Test-ESXiCertificateNeedsRegen {
     .OUTPUTS
         PSCustomObject with:
           .NeedsRegen  [bool]   - $true if CN does not match hostname
-          .Thumbprint  [string] - SHA-256 thumbprint formatted with colons
+          .Thumbprint  [string] - SHA256:<base64> thumbprint as expected by SDDC Manager
           .CN          [string] - CN extracted from the certificate Subject
           .Expiry      [string] - Certificate expiry date
     #>
@@ -739,8 +750,62 @@ function Get-CellColor ($value) {
     if ($value -eq "Partial")                          { return "Yellow"   }
     if ($value -eq "Timeout")                          { return "Red"      }
     if ($value -like "Unexpected*")                    { return "Yellow"   }
+    if ($value -like "WARN:*")                         { return "Yellow"   }
     return "White"
 }
+function Test-DNSResolution {
+    <#
+    .SYNOPSIS
+        Validates forward and reverse DNS resolution for an ESXi host FQDN.
+
+    .DESCRIPTION
+        Performs a forward lookup (FQDN to IP) and a reverse lookup (IP back
+        to FQDN) and returns a structured result. A mismatch or failure will
+        cause SDDC Manager commissioning to fail, so this is checked early
+        per host before any configuration changes are made.
+
+    .PARAMETER VMHost
+        FQDN of the ESXi host to validate.
+
+    .OUTPUTS
+        PSCustomObject with:
+          .Status   [string] - "OK", "FAILED", or "WARN:<detail>"
+          .Forward  [string] - resolved IP address, or error message
+          .Reverse  [string] - PTR name resolved from that IP, or error message
+    #>
+    param (
+        [Parameter(Mandatory)][string]$VMHost
+    )
+
+    try {
+        # Forward lookup
+        $forwardResult = [System.Net.Dns]::GetHostAddresses($VMHost)
+        $ip = ($forwardResult | Where-Object { $_.AddressFamily -eq 'InterNetwork' } | Select-Object -First 1).IPAddressToString
+        if (-not $ip) {
+            $ip = $forwardResult[0].IPAddressToString
+        }
+
+        # Reverse lookup
+        try {
+            $reverseResult = [System.Net.Dns]::GetHostEntry($ip)
+            $ptr = $reverseResult.HostName
+
+            # Compare PTR to FQDN (case-insensitive, strip trailing dot)
+            $ptrClean = $ptr.TrimEnd('.')
+            if ($ptrClean -ieq $VMHost) {
+                return [PSCustomObject]@{ Status = "OK";              Forward = $ip; Reverse = $ptr }
+            } else {
+                return [PSCustomObject]@{ Status = "WARN:PTR mismatch ($ptrClean)"; Forward = $ip; Reverse = $ptr }
+            }
+        } catch {
+            return [PSCustomObject]@{ Status = "WARN:No PTR record"; Forward = $ip; Reverse = "N/A" }
+        }
+
+    } catch {
+        return [PSCustomObject]@{ Status = "FAILED"; Forward = "N/A"; Reverse = "N/A" }
+    }
+}
+
 
 function Write-ColorSummaryTable {
     param (
@@ -751,6 +816,7 @@ function Write-ColorSummaryTable {
     $columns = [ordered]@{
         Host             = 34
         Connected        = 11
+        DNS              = 14
         NTP              = 6
         AdvancedSettings = 17
         OptionalSettings = 17
@@ -775,15 +841,6 @@ function Write-ColorSummaryTable {
 
     # Data rows
     foreach ($row in $Data) {
-        $line = "|"
-        foreach ($col in $columns.GetEnumerator()) {
-            $val   = $row.($col.Key)
-            $display = if ($null -eq $val) { "" } else { "$val" }
-            # Truncate if too wide
-            if ($display.Length -gt $col.Value) { $display = $display.Substring(0, $col.Value - 1) + "~" }
-            $line += " {0,-$($col.Value)} |" -f $display
-        }
-
         # Determine row base colour from Connected + Error
         $rowColor = if ($row.Error) { "Red" } elseif ($row.Connected) { "White" } else { "DarkYellow" }
 
@@ -860,6 +917,13 @@ function Write-HtmlReport {
         "
         <tr class='$rowClass'>
             <td>$([System.Web.HttpUtility]::HtmlEncode($row.Host))</td>
+            <td>$(
+                if     ($row.DNS -eq 'OK')       { '<span style="color:#3fb950">OK</span>' }
+                elseif ($row.DNS -eq 'FAILED')   { '<span style="color:#f85149">FAILED -- no A record</span>' }
+                elseif ($row.DNS -eq 'Skipped')  { '<span style="color:#6e7681">Skipped</span>' }
+                elseif ($row.DNS -like 'WARN:*') { '<span style="color:#d29922">' + [System.Web.HttpUtility]::HtmlEncode($row.DNS) + '</span>' }
+                else                             { [System.Web.HttpUtility]::HtmlEncode($row.DNS) }
+            )</td>
             $thumbCell
             $expiryCell
             <td>$(
@@ -958,6 +1022,7 @@ function Write-HtmlReport {
   <thead>
     <tr>
       <th>Host FQDN</th>
+      <th>DNS</th>
       <th>SSL Thumbprint (SHA256:base64)</th>
       <th>Cert Expiry</th>
       <th>Cert Regen</th>
@@ -1148,12 +1213,14 @@ foreach ($esxiHost in $targetEsxiHosts) {
     $script:hostTimedOut = $false
 
     Write-Host ("`n" + ("=" * 60)) -ForegroundColor Cyan
-    Write-Host "Processing host: $esxiHost" -ForegroundColor Cyan
+    Write-Host ("  Processing host : $esxiHost") -ForegroundColor Cyan
+    Write-Host ("  " + $ScriptMeta.Blog) -ForegroundColor DarkGray
     Write-Host ("=" * 60) -ForegroundColor Cyan
 
     $hostResult = [PSCustomObject]@{
         Host              = $esxiHost
         Connected         = $false
+        DNS               = "Skipped"
         NTP               = "Skipped"
         AdvancedSettings  = "Skipped"
         OptionalSettings  = "Skipped"
@@ -1166,9 +1233,33 @@ foreach ($esxiHost in $targetEsxiHosts) {
     }
 
     try {
-        # --- Connect ---
+        # --- DNS Validation (before connect, so issues are visible even if host is unreachable) ---
+        Write-Host "`n  [DNS Validation]" -ForegroundColor Cyan
         if ($DryRun) {
-            Write-Host "  [DRY RUN] Would connect to $esxiHost as 'root'." -ForegroundColor DarkYellow
+            Write-Host "  [DRY RUN] Would validate forward and reverse DNS for $esxiHost." -ForegroundColor DarkYellow
+            $hostResult.DNS = "OK"
+        } else {
+            $dnsCheck = Test-DNSResolution -VMHost $esxiHost
+            $hostResult.DNS = $dnsCheck.Status
+            if ($dnsCheck.Status -eq "OK") {
+                Write-Host "  Forward : $($dnsCheck.Forward)" -ForegroundColor Green
+                Write-Host "  Reverse : $($dnsCheck.Reverse)" -ForegroundColor Green
+                Write-Host "  DNS OK -- forward and reverse match." -ForegroundColor Green
+            } elseif ($dnsCheck.Status -eq "FAILED") {
+                Write-Host "  Forward lookup failed for $esxiHost." -ForegroundColor Red
+                Write-Host "  ACTION REQUIRED: Ensure an A record exists for this host." -ForegroundColor Red
+            } else {
+                Write-Host "  Forward : $($dnsCheck.Forward)" -ForegroundColor Yellow
+                Write-Host "  Reverse : $($dnsCheck.Reverse)" -ForegroundColor Yellow
+                Write-Host "  WARNING: $($dnsCheck.Status)" -ForegroundColor Yellow
+                Write-Host "  ACTION REQUIRED: Fix PTR record before commissioning." -ForegroundColor Yellow
+            }
+        }
+
+        # --- Connect ---
+        Write-Host "`n  [Connect]" -ForegroundColor Cyan
+        if ($DryRun) {
+            Write-Host "`n  [DRY RUN] Would connect to $esxiHost as 'root'." -ForegroundColor DarkYellow
             $hostResult.Connected = $true
         } else {
             Connect-VIServer -Server $esxiHost -Credential $esxiCredentials -ErrorAction Stop | Out-Null
@@ -1308,6 +1399,7 @@ foreach ($esxiHost in $targetEsxiHosts) {
                         # Wait for the host to come back (throws on timeout)
                         Wait-ESXiHostOnline -VMHost $esxiHost
                         $hostResult.Rebooted = "OK"
+
                         # Reconnect for remaining steps (password reset)
                         Write-Host "  Reconnecting to $esxiHost..." -ForegroundColor Cyan
                         Connect-VIServer -Server $esxiHost -Credential $esxiCredentials -ErrorAction Stop | Out-Null
@@ -1388,13 +1480,13 @@ foreach ($esxiHost in $targetEsxiHosts) {
 #region --- Summary ---
 
 # Derive summary banner width from column definitions (matches Write-ColorSummaryTable divider)
-$summaryColumnWidths = @(34, 11, 6, 17, 17, 10, 10, 15, 28)
+$summaryColumnWidths = @(34, 11, 14, 6, 17, 17, 10, 10, 15, 28)
 $summaryWidth = ($summaryColumnWidths | Measure-Object -Sum).Sum + ($summaryColumnWidths.Count * 3) + 1
 
 
 Write-Host ""
 Write-Host ("=" * $summaryWidth) -ForegroundColor DarkCyan
-Write-Host ("  SUMMARY  -  {0} host(s) processed" -f $results.Count) -ForegroundColor Cyan
+Write-Host ("  SUMMARY  -  {0} host(s) processed  --  {1}" -f $results.Count, $ScriptMeta.Blog) -ForegroundColor Cyan
 Write-Host ("=" * $summaryWidth) -ForegroundColor DarkCyan
 
 Write-ColorSummaryTable -Data $results
