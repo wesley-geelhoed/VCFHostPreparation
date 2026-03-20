@@ -14,8 +14,9 @@
          $OptionalAdvancedSettings block at the top of the script
       6. Storage type detection  --  detect VMFS_FC (FC HBA present) or NFS
          (NFS datastore mounted); defaults to VSAN otherwise. Note: vSAN OSA
-         vs ESA cannot be auto-detected on unclaimed hosts -- override to
-         VSAN_ESA in Commission-VCFHosts.ps1 if ESA is intended
+         vs ESA cannot be auto-detected on unclaimed hosts -- edit the
+         StorageType column in the CSV before running Commission-VCFHosts.ps1
+         if VSAN_ESA or VVOL is intended
       7. Certificate regeneration  --  check CN vs FQDN; if mismatched, enable
          SSH temporarily, run /sbin/generate-certificates via Posh-SSH, disable
          SSH, reboot, and wait for the host to return online
@@ -37,8 +38,10 @@
       - VSAN      : default for all other hosts (unclaimed disks)
 
     vSAN OSA vs ESA cannot be distinguished on a freshly prepped host because
-    disks are unclaimed at commissioning time. If ESA is intended, override the
-    storage type interactively in Commission-VCFHosts.ps1 or edit the CSV.
+    disks are unclaimed at commissioning time. If VSAN_ESA or VVOL is intended,
+    edit the StorageType column in the generated CSV before running
+    Commission-VCFHosts.ps1. That script reads the CSV value as-is without
+    prompting.
 
     Optional Advanced Settings
     --------------------------

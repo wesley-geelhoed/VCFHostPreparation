@@ -73,7 +73,7 @@
 
 .NOTES
     Script  : Commission-VCFHosts.ps1
-    Version : 2.0.0
+    Version : 2.2.0
     Author  : Paul van Dieen
     Blog    : https://www.hollebollevsan.nl
     Date    : 2026-03-20
@@ -128,6 +128,18 @@
                 properties; Get-CheckFqdn and Get-CheckMessages helpers updated;
                 Collect-HostFailures now matches top-level per-host check
                 entries directly; console output also shows errorResponse fields
+        2.1.0 - Fixed validation check counts: wrapper check "Validating input
+                specification" excluded from pass/fail/warn counts as its
+                resultStatus differs from the per-host checks beneath it;
+                overall status now taken from top-level resultStatus field
+                rather than derived from counts; same fix applied to console
+                validationFailed logic; footer branding updated with clickable
+                blog link and script version in both HTML reports
+        2.2.0 - Removed per-host interactive storage type prompt; storage type
+                is now read directly from the CSV without prompting; script
+                displays detected values and warns on unrecognised types;
+                user edits the CSV StorageType column before running if any
+                value needs changing
 #>
 
 [CmdletBinding()]
@@ -164,7 +176,7 @@ param (
 
 $ScriptMeta = @{
     Name    = "Commission-VCFHosts.ps1"
-    Version = "2.0.0"
+    Version = "2.2.0"
     Author  = "Paul van Dieen"
     Blog    = "https://www.hollebollevsan.nl"
     Date    = "2026-03-20"
@@ -429,14 +441,27 @@ function Write-ValidationReport {
 
     $generatedAt   = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $passCount     = 0; $failCount = 0; $warnCount = 0
-    $overallStatus = "PASSED"
+
+    # Use the top-level resultStatus from SDDC Manager for the overall result.
+    # Do not re-derive from counts -- the wrapper check skews the numbers.
+    $overallStatus = switch ($ValidationStatus.resultStatus) {
+        "FAILED"  { "FAILED"  }
+        "WARNING" { "WARNING" }
+        default   { "PASSED"  }
+    }
 
     if ($ValidationStatus -and $ValidationStatus.PSObject.Properties["validationChecks"]) {
-        $passCount = [int]@($ValidationStatus.validationChecks | Where-Object { $_.resultStatus -eq "SUCCEEDED" } | Measure-Object).Count
-        $failCount = [int]@($ValidationStatus.validationChecks | Where-Object { $_.resultStatus -eq "FAILED"    } | Measure-Object).Count
-        $warnCount = [int]@($ValidationStatus.validationChecks | Where-Object { $_.resultStatus -eq "WARNING"   } | Measure-Object).Count
+        # Exclude the top-level wrapper check ("Validating input specification")
+        # which aggregates all hosts and has its own resultStatus that differs
+        # from the per-host checks underneath it.
+        $hostChecks = $ValidationStatus.validationChecks | Where-Object {
+            $_.description -notlike "*input specification*" -and
+            $_.description -notlike "*Validating input*"
+        }
+        $passCount = [int]@($hostChecks | Where-Object { $_.resultStatus -eq "SUCCEEDED" } | Measure-Object).Count
+        $failCount = [int]@($hostChecks | Where-Object { $_.resultStatus -eq "FAILED"    } | Measure-Object).Count
+        $warnCount = [int]@($hostChecks | Where-Object { $_.resultStatus -eq "WARNING"   } | Measure-Object).Count
     }
-    if ($failCount -gt 0) { $overallStatus = "FAILED" } elseif ($warnCount -gt 0) { $overallStatus = "WARNING" }
 
     # ── Helper: collect all messages from a check object ──────────────────
     # Checks flat properties first, then errorResponse.message (SDDC Manager v9 structure)
@@ -715,7 +740,7 @@ function Write-ValidationReport {
   only. $(if ($overallStatus -eq 'PASSED') { 'All checks passed -- run without -ValidateOnly to commission.' } else { 'Fix the failed checks above before commissioning.' })
 </div>
 
-<footer>Commission-VCFHosts.ps1 &bull; Paul van Dieen &bull; https://www.hollebollevsan.nl</footer>
+<footer>Commission-VCFHosts.ps1 v$ScriptVersion &bull; <a href="https://www.hollebollevsan.nl" style="color:#58a6ff;text-decoration:none">Paul van Dieen &bull; HolleBollevSAN</a></footer>
 
 </body>
 </html>
@@ -892,7 +917,7 @@ function Write-CommissionReport {
   workload domain creation and cluster expansion.
 </div>
 
-<footer>Commission-VCFHosts.ps1 &bull; Paul van Dieen &bull; https://www.hollebollevsan.nl</footer>
+<footer>Commission-VCFHosts.ps1 v$ScriptVersion &bull; <a href="https://www.hollebollevsan.nl" style="color:#58a6ff;text-decoration:none">Paul van Dieen &bull; HolleBollevSAN</a></footer>
 
 </body>
 </html>
@@ -1003,35 +1028,36 @@ Write-Host ""
 
 #endregion
 
-#region --- Storage Type Per Host ---
+#region --- Storage Type ---
 
-# Each host carries its own StorageType from the CSV (detected by HostPrep.ps1).
-# Show the per-host values and allow interactive override per host.
+# Storage type is read directly from the CSV -- detected per host by HostPrep.ps1.
+# VMFS_FC and NFS are auto-detected. Everything else defaults to VSAN.
+# If any host needs VSAN_ESA or VVOL, edit the StorageType column in the CSV
+# before running this script.
 $validStorageTypes = @("VSAN","VSAN_ESA","NFS","VMFS_FC","VVOL")
 
-Write-Host "  Storage types from CSV (detected by HostPrep.ps1):" -ForegroundColor Cyan
-Write-Host "  Valid options: VSAN, VSAN_ESA, NFS, VMFS_FC, VVOL" -ForegroundColor DarkGray
+Write-Host "  Storage types from CSV:" -ForegroundColor Cyan
+Write-Host "  (To change a value, edit the StorageType column in the CSV and re-run)" -ForegroundColor DarkGray
+Write-Host "  Valid values: VSAN, VSAN_ESA, NFS, VMFS_FC, VVOL" -ForegroundColor DarkGray
 Write-Host ""
 
-# Build per-host storage type map with interactive override
 $hostStorageMap = @{}
+$storageWarnings = $false
 foreach ($h in $hosts) {
-    $detected = if ($h.StorageType -and $h.StorageType -ne "") { $h.StorageType.ToUpper() } else { "VSAN" }
-    Write-Host ("  {0,-40} Detected: {1}" -f $h.FQDN, $detected) -ForegroundColor DarkGray
-    $override = (Read-Host ("    Press Enter to accept '{0}', or type a different storage type" -f $detected)).Trim().ToUpper()
+    $storageType = if ($h.StorageType -and $h.StorageType -ne "") { $h.StorageType.ToUpper() } else { "VSAN" }
+    $hostStorageMap[$h.FQDN] = $storageType
 
-    if ($override -and $override -ne "") {
-        if ($override -notin $validStorageTypes) {
-            Write-Host ("    WARNING: '{0}' is not a recognised storage type. Using it anyway." -f $override) -ForegroundColor Yellow
-        }
-        $hostStorageMap[$h.FQDN] = $override
-        Write-Host ("    Using: {0}" -f $override) -ForegroundColor Green
-    } else {
-        $hostStorageMap[$h.FQDN] = $detected
-        Write-Host ("    Using: {0}" -f $detected) -ForegroundColor Green
-    }
-    Write-Host ""
+    $typeColor = if ($storageType -notin $validStorageTypes) { "Yellow" } else { "DarkGray" }
+    if ($storageType -notin $validStorageTypes) { $storageWarnings = $true }
+    Write-Host ("    {0,-42} {1}" -f $h.FQDN, $storageType) -ForegroundColor $typeColor
 }
+
+if ($storageWarnings) {
+    Write-Host ""
+    Write-Host "  WARNING: One or more hosts have an unrecognised storage type." -ForegroundColor Yellow
+    Write-Host "  Edit the CSV and correct the StorageType column before proceeding." -ForegroundColor Yellow
+}
+Write-Host ""
 
 #endregion
 
@@ -1113,9 +1139,15 @@ try {
     # Determine actual failure from individual check results, NOT executionStatus.
     # SDDC Manager returns executionStatus="COMPLETED" even when checks fail --
     # the real failure state is in validationChecks[].resultStatus.
-    $checksFailed  = @($valStatus.validationChecks | Where-Object { $_.resultStatus -eq "FAILED"  })
-    $checksWarned  = @($valStatus.validationChecks | Where-Object { $_.resultStatus -eq "WARNING" })
-    $validationFailed = ($checksFailed.Count -gt 0)
+    # Exclude the "Validating input specification" wrapper from counts
+    $hostLevelChecks  = @($valStatus.validationChecks | Where-Object {
+        $_.description -notlike "*input specification*" -and
+        $_.description -notlike "*Validating input*"
+    })
+    $checksFailed  = @($hostLevelChecks | Where-Object { $_.resultStatus -eq "FAILED"  })
+    $checksWarned  = @($hostLevelChecks | Where-Object { $_.resultStatus -eq "WARNING" })
+    # Also honour the top-level resultStatus from SDDC Manager
+    $validationFailed = ($checksFailed.Count -gt 0) -or ($valStatus.resultStatus -eq "FAILED")
 
     # Print full per-check breakdown
     Write-Host "  Validation results:" -ForegroundColor Cyan
