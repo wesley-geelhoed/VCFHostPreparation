@@ -73,7 +73,7 @@
 
 .NOTES
     Script  : Commission-VCFHosts.ps1
-    Version : 1.7.0
+    Version : 1.8.0
     Author  : Paul van Dieen
     Blog    : https://www.hollebollevsan.nl
     Date    : 2026-03-20
@@ -110,6 +110,13 @@
         1.7.0 - Fixed Get-SddcManagerVersion: now queries GET /v1/sddc-managers
                 (correct endpoint, returns elements[].version) with fallback
                 to GET /v1/system/about; resolves "Unknown" version display
+        1.8.0 - Fixed validation failure detection: was checking executionStatus
+                which SDDC Manager always sets to COMPLETED even when checks
+                fail; now checks validationChecks[].resultStatus directly;
+                payload and validation response always saved to disk regardless
+                of outcome; per-check drilling extended to 3 levels deep and
+                covers checkItems property; executionStatus and check counts
+                printed for transparency
 #>
 
 [CmdletBinding()]
@@ -146,7 +153,7 @@ param (
 
 $ScriptMeta = @{
     Name    = "Commission-VCFHosts.ps1"
-    Version = "1.7.0"
+    Version = "1.8.0"
     Author  = "Paul van Dieen"
     Blog    = "https://www.hollebollevsan.nl"
     Date    = "2026-03-20"
@@ -982,8 +989,24 @@ try {
         Write-Host "  Validation in progress..." -ForegroundColor DarkGray
     }
 
-    # Print full per-check breakdown
+    # Always save raw validation response and payload for inspection
+    $valJsonPath = $PayloadPath -replace '_Payload\.json$', '_ValidationResponse.json'
+    $valStatus | ConvertTo-Json -Depth 10 | Out-File -FilePath $valJsonPath -Encoding UTF8
+    if (-not $SavePayload) {
+        $payloadJson | Out-File -FilePath $PayloadPath -Encoding UTF8
+    }
+    Write-Host ("  Payload saved to     : {0}" -f $PayloadPath) -ForegroundColor DarkGray
+    Write-Host ("  Validation response  : {0}" -f $valJsonPath) -ForegroundColor DarkGray
     Write-Host ""
+
+    # Determine actual failure from individual check results, NOT executionStatus.
+    # SDDC Manager returns executionStatus="COMPLETED" even when checks fail --
+    # the real failure state is in validationChecks[].resultStatus.
+    $checksFailed  = @($valStatus.validationChecks | Where-Object { $_.resultStatus -eq "FAILED"  })
+    $checksWarned  = @($valStatus.validationChecks | Where-Object { $_.resultStatus -eq "WARNING" })
+    $validationFailed = ($checksFailed.Count -gt 0)
+
+    # Print full per-check breakdown
     Write-Host "  Validation results:" -ForegroundColor Cyan
     if ($valStatus -and $valStatus.PSObject.Properties["validationChecks"]) {
         foreach ($check in $valStatus.validationChecks) {
@@ -1001,23 +1024,50 @@ try {
             }
             Write-Host ("    {0} {1}" -f $icon, $check.description) -ForegroundColor $checkColor
 
-            # Print any error or result message on the check itself
-            foreach ($msgProp in @("errorMessage","message","resultMessage")) {
+            # Print all available message properties on the check
+            foreach ($msgProp in @("errorMessage","message","resultMessage","description")) {
+                # skip description -- already printed above
+                if ($msgProp -eq "description") { continue }
                 if ($check.PSObject.Properties[$msgProp] -and $check.$msgProp) {
-                    Write-Host ("           $msgProp : $($check.$msgProp)") -ForegroundColor DarkGray
+                    Write-Host ("           {0}: {1}" -f $msgProp, $check.$msgProp) -ForegroundColor DarkGray
                 }
             }
 
-            # Drill into nested checks if present (SDDC Manager sometimes nests per-host details)
-            foreach ($nestedProp in @("nestedValidationChecks","nestedChecks","validationChecks")) {
+            # Drill into nested checks -- SDDC Manager nests per-host detail here
+            foreach ($nestedProp in @("nestedValidationChecks","nestedChecks","validationChecks","checkItems")) {
                 if ($check.PSObject.Properties[$nestedProp] -and $check.$nestedProp) {
                     foreach ($nested in $check.$nestedProp) {
-                        $nestedColor = if ($nested.resultStatus -eq "FAILED") { "Red" } elseif ($nested.resultStatus -eq "WARNING") { "Yellow" } else { "DarkGray" }
-                        $nestedIcon  = if ($nested.resultStatus -eq "FAILED") { "[FAIL]" } elseif ($nested.resultStatus -eq "WARNING") { "[WARN]" } else { "[INFO]" }
-                        Write-Host ("      $nestedIcon $($nested.description)") -ForegroundColor $nestedColor
+                        $nestedColor = switch ($nested.resultStatus) {
+                            "FAILED"    { "Red"    }
+                            "WARNING"   { "Yellow" }
+                            "SUCCEEDED" { "Green"  }
+                            default     { "DarkGray" }
+                        }
+                        $nestedIcon = switch ($nested.resultStatus) {
+                            "FAILED"    { "[FAIL]" }
+                            "WARNING"   { "[WARN]" }
+                            "SUCCEEDED" { "[PASS]" }
+                            default     { "[INFO]" }
+                        }
+                        Write-Host ("      {0} {1}" -f $nestedIcon, $nested.description) -ForegroundColor $nestedColor
                         foreach ($msgProp in @("errorMessage","message","resultMessage")) {
                             if ($nested.PSObject.Properties[$msgProp] -and $nested.$msgProp) {
-                                Write-Host ("             $msgProp : $($nested.$msgProp)") -ForegroundColor DarkGray
+                                Write-Host ("             {0}: {1}" -f $msgProp, $nested.$msgProp) -ForegroundColor DarkGray
+                            }
+                        }
+                        # One more level deep -- some SDDC Manager versions nest 3 levels
+                        foreach ($deepProp in @("nestedValidationChecks","nestedChecks","checkItems")) {
+                            if ($nested.PSObject.Properties[$deepProp] -and $nested.$deepProp) {
+                                foreach ($deep in $nested.$deepProp) {
+                                    $deepColor = if ($deep.resultStatus -eq "FAILED") { "Red" } elseif ($deep.resultStatus -eq "WARNING") { "Yellow" } else { "DarkGray" }
+                                    $deepIcon  = if ($deep.resultStatus -eq "FAILED") { "[FAIL]" } elseif ($deep.resultStatus -eq "WARNING") { "[WARN]" } else { "[INFO]" }
+                                    Write-Host ("         {0} {1}" -f $deepIcon, $deep.description) -ForegroundColor $deepColor
+                                    foreach ($msgProp in @("errorMessage","message","resultMessage")) {
+                                        if ($deep.PSObject.Properties[$msgProp] -and $deep.$msgProp) {
+                                            Write-Host ("                {0}: {1}" -f $msgProp, $deep.$msgProp) -ForegroundColor DarkGray
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -1026,40 +1076,12 @@ try {
         }
     }
     Write-Host ""
-
-    # Also dump the raw validation response for inspection
-    Write-Host "  Raw validation response saved to console log above." -ForegroundColor DarkGray
-    Write-Host ("  Validation ID: {0}" -f $validation.id) -ForegroundColor DarkGray
+    Write-Host ("  executionStatus : {0}  (checks failed: {1}  warnings: {2})" -f $valStatus.executionStatus, $checksFailed.Count, $checksWarned.Count) -ForegroundColor DarkGray
+    Write-Host ("  Validation ID   : {0}" -f $validation.id) -ForegroundColor DarkGray
     Write-Host ""
 
-    if ($valStatus.executionStatus -eq "FAILED") {
-        # Always save payload on validation failure so the user can inspect what was sent
-        if (-not $SavePayload) {
-            $payloadJson | Out-File -FilePath $PayloadPath -Encoding UTF8
-            Write-Host ("  Payload saved to: {0}" -f $PayloadPath) -ForegroundColor Yellow
-            Write-Host "  Review this file to verify the FQDN, thumbprint, storage type and network pool that were sent." -ForegroundColor Yellow
-        }
-        # Also dump the raw validation status as JSON for full inspection
-        $valJsonPath = $PayloadPath -replace '_Payload\.json$', '_ValidationResponse.json'
-        $valStatus | ConvertTo-Json -Depth 10 | Out-File -FilePath $valJsonPath -Encoding UTF8
-        Write-Host ("  Full validation response saved to: {0}" -f $valJsonPath) -ForegroundColor Yellow
-        Write-Host ""
-        Write-Host "  Validation FAILED -- fix the errors above before commissioning." -ForegroundColor Red
-        if ($ValidateOnly) {
-            Write-ValidationReport `
-                -ValidationStatus $valStatus `
-                -Path             $ValidateReportPath `
-                -ValidationId     $validation.id `
-                -SddcManager      $SddcManager `
-                -SddcVersion      $sddcVersion `
-                -NetworkPool      $selectedPool.name `
-                -ScriptVersion    $ScriptMeta.Version `
-                -Hosts            @($hosts)
-            Write-Host ("=" * 62) -ForegroundColor DarkCyan
-            Write-Host ""
-            exit 1
-        }
-        # Also write validation report on normal-mode failure before aborting
+    if ($validationFailed) {
+        Write-Host "  Validation FAILED -- $($checksFailed.Count) check(s) failed. Fix the errors above before commissioning." -ForegroundColor Red
         Write-ValidationReport `
             -ValidationStatus $valStatus `
             -Path             $ValidateReportPath `
@@ -1069,6 +1091,11 @@ try {
             -NetworkPool      $selectedPool.name `
             -ScriptVersion    $ScriptMeta.Version `
             -Hosts            @($hosts)
+        if ($ValidateOnly) {
+            Write-Host ("=" * 62) -ForegroundColor DarkCyan
+            Write-Host ""
+            exit 1
+        }
         exit 1
     }
 
