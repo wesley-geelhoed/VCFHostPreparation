@@ -1,66 +1,102 @@
 ﻿<#
 .SYNOPSIS
-    Commissions ESXi hosts into SDDC Manager as part of a VMware Cloud Foundation deployment.
+    Commissions ESXi hosts into SDDC Manager as part of a VMware Cloud Foundation 9
+    deployment.
 
 .DESCRIPTION
-    Reads the commissioning CSV produced by HostPrep.ps1, prompts for SDDC Manager
-    credentials and the target network pool, then submits all hosts to the SDDC Manager
-    commission API in a single batch. The script polls the resulting task until it
-    completes or times out and prints a per-host result summary.
+    Reads the commissioning CSV produced by HostPrep.ps1 and commissions all hosts
+    into SDDC Manager in a single batch via the REST API.
 
     Workflow
     --------
-      1. Read host list and thumbprints from the HostPrep CSV
+      1. Read host FQDNs, thumbprints and detected storage types from the CSV
       2. Prompt for SDDC Manager FQDN, username and password
       3. Authenticate and retrieve a Bearer token
-      4. Detect API version from SDDC Manager
+      4. Detect SDDC Manager version via GET /v1/sddc-managers
       5. Retrieve available network pools and prompt for selection
-      6. Prompt for storage type (per-deployment or per-host override from CSV)
-      7. Validate hosts via POST /v1/hosts/validations with per-check output
-         (if -ValidateOnly is set: print summary and exit without commissioning)
-      8. Commission hosts via POST /v1/hosts
-      9. Poll task status until SUCCESSFUL, FAILED, or timeout
-     10. Query GET /v1/hosts to retrieve the SDDC Manager host IDs
-     11. Print colourised result summary with host IDs
-     12. Write results CSV and dark-mode HTML report
+      6. Display per-host storage type from CSV -- no prompting; edit the CSV
+         StorageType column before running if any value needs changing
+         (VSAN_ESA and VVOL must always be set manually in the CSV)
+      7. Prompt for the ESXi root password (required by SDDC Manager)
+      8. Save sanitised JSON payload to disk (password masked)
+      9. Validate hosts via POST /v1/hosts/validations
+         - Flattens nested VCF 9 check structure to get per-host results
+         - Prints per-check output with PASS/FAIL/WARN icons and error detail
+         - Saves full validation response JSON to disk
+         - Writes dark-mode HTML validation report and opens it in the browser
+         - Aborts on failure (if -ValidateOnly: exits without commissioning)
+     10. Commission hosts via POST /v1/hosts
+     11. Poll task every 15 seconds until SUCCESSFUL, FAILED, or timeout
+     12. Query GET /v1/hosts to retrieve the SDDC Manager host UUID per host
+     13. Print colourised per-host summary table with host UUIDs
+     14. Write dark-mode HTML commissioning report and results CSV; open in browser
 
     CSV Format (produced by HostPrep.ps1)
     --------------------------------------
     FQDN,Thumbprint,StorageType
     esxi01.vcf.lab,SHA256:abc123...,VSAN
-    esxi02.vcf.lab,SHA256:def456...,VSAN
+    esxi02.vcf.lab,SHA256:def456...,VMFS_FC
 
-    The StorageType column in the CSV is used as the default. You can override it
-    interactively when prompted.
+    StorageType is detected per host by HostPrep.ps1 (VMFS_FC and NFS are
+    auto-detected; everything else defaults to VSAN). Edit the column before
+    running this script if VSAN_ESA or VVOL is intended.
+
+    Output Files
+    ------------
+    All files are written next to the script with a timestamp prefix:
+      Commission_<ts>_Payload.json          Sanitised JSON payload (always)
+      Commission_<ts>_ValidationResponse.json  Raw SDDC Manager response (always)
+      Commission_<ts>_ValidationReport.html  Validation HTML report (always)
+      Commission_<ts>_Report.html           Commissioning HTML report (on success)
+      Commission_<ts>_Results.csv           Per-host results with UUIDs (on success)
+
+    Validation Report
+    -----------------
+    The HTML validation report includes:
+      - Stat cards: overall status, pass/warn/fail counts (wrapper check excluded)
+      - Per-host summary: actual PASS/FAIL/WARN status per host with error message
+      - Full check table: all leaf checks with nested detail expanded inline
 
 .PARAMETER CsvPath
-    Path to the commissioning CSV file produced by HostPrep.ps1.
-    If not specified the script will prompt for it.
+    Path to the commissioning CSV produced by HostPrep.ps1.
+    Prompted interactively if not supplied.
 
 .PARAMETER SddcManager
     FQDN of the SDDC Manager appliance.
-    If not specified the script will prompt for it.
+    Prompted interactively if not supplied.
 
 .PARAMETER TimeoutMinutes
     Maximum minutes to wait for the commission task to complete. Default: 30.
 
 .PARAMETER ValidateOnly
-    Runs the SDDC Manager pre-commissioning validation (POST /v1/hosts/validations)
-    and prints a detailed per-check result for every host -- without commissioning
-    anything. Use this to verify readiness before committing to the commission step.
-    The ESXi root password is still required as SDDC Manager needs it for validation.
+    Runs POST /v1/hosts/validations and exits without commissioning. Writes the
+    HTML validation report and saves the payload and response JSON to disk.
+    The ESXi root password is still required by SDDC Manager for validation.
 
 .PARAMETER SkipCertificateCheck
     Ignore TLS certificate errors when connecting to SDDC Manager.
-    Useful in lab environments where SDDC Manager uses a self-signed certificate.
+    Useful in lab environments with self-signed certificates.
+
+.PARAMETER SavePayload
+    Always save the sanitised JSON payload to disk. By default the payload is
+    saved on every run; this switch existed before that behaviour was made the
+    default and is retained for compatibility.
 
 .PARAMETER ReportPath
-    Path for the HTML commissioning report. Defaults to the script folder with a
-    timestamp filename: Commission_<timestamp>_Report.html.
+    Path for the HTML commissioning report. Defaults to the script folder:
+    Commission_<timestamp>_Report.html.
 
 .PARAMETER OutputCsvPath
-    Path for the commissioning results CSV. Defaults to the script folder with a
-    timestamp filename: Commission_<timestamp>_Results.csv.
+    Path for the results CSV. Defaults to the script folder:
+    Commission_<timestamp>_Results.csv.
+
+.PARAMETER PayloadPath
+    Path for the sanitised JSON payload. Defaults to the script folder:
+    Commission_<timestamp>_Payload.json.
+
+.PARAMETER ValidateReportPath
+    Path for the HTML validation report. Defaults to the script folder:
+    Commission_<timestamp>_ValidationReport.html.
 
 .EXAMPLE
     .\Commission-VCFHosts.ps1
@@ -71,9 +107,15 @@
 .EXAMPLE
     .\Commission-VCFHosts.ps1 -ValidateOnly
 
+.EXAMPLE
+    .\Commission-VCFHosts.ps1 -SkipCertificateCheck
+
+.EXAMPLE
+    .\Commission-VCFHosts.ps1 -ValidateOnly -SddcManager sddc-manager.vcf.lab -CsvPath "C:\VCF\hosts.csv"
+
 .NOTES
     Script  : Commission-VCFHosts.ps1
-    Version : 2.5.0
+    Version : 2.6.0
     Author  : Paul van Dieen
     Blog    : https://www.hollebollevsan.nl
     Date    : 2026-03-20
@@ -157,6 +199,13 @@
                 their spec check but failed the overall validation now show
                 correctly; message detail shown in appropriate colour per
                 status; column renamed from "Issues" to "Validation Result"
+        2.6.0 - Fixed per-host status and counts: SDDC Manager sets resultStatus
+                on per-host checks based on spec validation only; actual
+                connectivity failures are only in errorResponse.message;
+                status now derived from message content -- messages not
+                matching "succeeded/success/passed" are treated as failures;
+                passing hosts whose batch failed due to another host now show
+                correctly as PASS with informational message in grey
 #>
 
 [CmdletBinding()]
@@ -193,7 +242,7 @@ param (
 
 $ScriptMeta = @{
     Name    = "Commission-VCFHosts.ps1"
-    Version = "2.5.0"
+    Version = "2.6.0"
     Author  = "Paul van Dieen"
     Blog    = "https://www.hollebollevsan.nl"
     Date    = "2026-03-20"
@@ -491,17 +540,30 @@ function Write-ValidationReport {
     }
 
     if ($ValidationStatus -and $ValidationStatus.PSObject.Properties["validationChecks"]) {
-        # Flatten all nested checks and count only the leaf/per-host entries.
-        # Top-level validationChecks may only contain wrapper entries; the real
-        # per-host checks live inside nestedValidationChecks.
+        # Flatten and filter wrapper checks
         $leafChecks = Get-AllLeafChecks $ValidationStatus.validationChecks
         $hostChecks = $leafChecks | Where-Object {
             $_.description -notlike "*input specification*" -and
             $_.description -notlike "*Validating input*"
         }
-        $passCount = [int]@($hostChecks | Where-Object { $_.resultStatus -eq "SUCCEEDED" } | Measure-Object).Count
-        $failCount = [int]@($hostChecks | Where-Object { $_.resultStatus -eq "FAILED"    } | Measure-Object).Count
-        $warnCount = [int]@($hostChecks | Where-Object { $_.resultStatus -eq "WARNING"   } | Measure-Object).Count
+        # Use message-content based status -- resultStatus reflects spec check only,
+        # not connectivity. A check with resultStatus=SUCCEEDED but a failure message
+        # is a real failure.
+        $passCount = 0; $failCount = 0; $warnCount = 0
+        foreach ($hc in $hostChecks) {
+            $hMsgs = Get-CheckMessages $hc
+            $isRealFail = $false
+            foreach ($m in $hMsgs) {
+                if ($m -notmatch "(?i)succeeded|success|passed") { $isRealFail = $true; break }
+            }
+            if ($isRealFail) {
+                $failCount++
+            } elseif ($hc.resultStatus -eq "WARNING") {
+                $warnCount++
+            } else {
+                $passCount++
+            }
+        }
     }
 
     # ── Helper: collect all messages from a check object ──────────────────
@@ -627,31 +689,66 @@ function Write-ValidationReport {
     }
 
     # Build per-host rows
+    # Note: SDDC Manager sets resultStatus on per-host checks based on spec
+    # validation only, not connectivity. The actual failure reason is in
+    # errorResponse.message. We use the overall validation resultStatus combined
+    # with the message content to determine the true per-host display status:
+    #   - If the check has errorResponse.message indicating a real failure
+    #     (not "succeeded"), show as FAIL with that message in red
+    #   - If message says "succeeded" or is absent and resultStatus is SUCCEEDED,
+    #     show as PASS -- this host is fine; the batch failed due to another host
+    #   - If the overall validation passed, all matched hosts are PASS
+    $overallFailed = ($overallStatus -ne "PASSED")
+
     $hostRows = ""
     foreach ($h in $Hosts) {
-        $check    = $hostCheckMap[$h.FQDN]
-        $status   = if ($check) { $check.resultStatus } else { "UNKNOWN" }
-        $msgs     = if ($check) { Get-CheckMessages $check } else { [System.Collections.Generic.List[string]]::new() }
+        $check = $hostCheckMap[$h.FQDN]
+        $msgs  = if ($check) { Get-CheckMessages $check } else { [System.Collections.Generic.List[string]]::new() }
 
-        $rowClass = switch ($status) {
+        # Determine effective status from message content
+        $hasRealFailure = $false
+        $realFailureMsg = ""
+        foreach ($m in $msgs) {
+            # Treat as real failure if message does NOT indicate success
+            if ($m -notmatch "(?i)succeeded|success|passed") {
+                $hasRealFailure = $true
+                $realFailureMsg = $m
+                break
+            }
+        }
+
+        $effectiveStatus = if ($hasRealFailure) {
+            "FAILED"
+        } elseif ($check -and $check.resultStatus -eq "WARNING") {
+            "WARNING"
+        } elseif ($check -and $check.resultStatus -eq "SUCCEEDED") {
+            "SUCCEEDED"
+        } elseif ($overallFailed -and -not $check) {
+            "UNKNOWN"
+        } else {
+            "SUCCEEDED"
+        }
+
+        $rowClass = switch ($effectiveStatus) {
             "SUCCEEDED" { "ok"   }
             "FAILED"    { "fail" }
             "WARNING"   { "warn" }
             default     { ""     }
         }
-        $statusBadge = switch ($status) {
+        $statusBadge = switch ($effectiveStatus) {
             "SUCCEEDED" { "<span style='color:#3fb950'>&#10004; PASS</span>" }
             "FAILED"    { "<span style='color:#f85149'>&#10008; FAIL</span>" }
             "WARNING"   { "<span style='color:#d29922'>&#9888; WARN</span>"  }
-            default     { "<span style='color:#8b949e'>&#9679; $([System.Web.HttpUtility]::HtmlEncode($status))</span>" }
+            default     { "<span style='color:#8b949e'>&#9679; UNKNOWN</span>" }
         }
 
-        $msgColor  = if ($status -eq "SUCCEEDED") { "#8b949e" } else { "#f85149" }
-        $msgDetail = if ($msgs.Count -gt 0) {
-            "<ul style='margin:4px 0 0 0;padding-left:16px;color:$msgColor;font-size:0.8rem'>" +
-            ($msgs | ForEach-Object { "<li>$_</li>" }) -join "" +
-            "</ul>"
-        } elseif ($status -eq "SUCCEEDED") {
+        $msgColor  = if ($effectiveStatus -eq "SUCCEEDED") { "#8b949e" } else { "#f85149" }
+        $msgDetail = if ($hasRealFailure) {
+            "<ul style='margin:4px 0 0 0;padding-left:16px;color:#f85149;font-size:0.8rem'><li>$realFailureMsg</li></ul>"
+        } elseif ($msgs.Count -gt 0) {
+            # Show message in grey -- it is informational (e.g. "spec validation succeeded")
+            "<div style='margin-top:4px;color:#8b949e;font-size:0.8rem'>$($msgs[0])</div>"
+        } elseif ($effectiveStatus -eq "SUCCEEDED") {
             "<div style='margin-top:4px;color:#8b949e;font-size:0.8rem'>No issues detected</div>"
         } else {
             "<div style='margin-top:4px;color:#f85149;font-size:0.8rem'>No detail available -- check ValidationResponse.json</div>"
