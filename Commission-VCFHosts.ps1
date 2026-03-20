@@ -1267,9 +1267,14 @@ try {
     if ($ValidateOnly) {
         $passCount = 0; $failCount = 0; $warnCount = 0
         if ($valStatus -and $valStatus.PSObject.Properties["validationChecks"]) {
-            $passCount = @($valStatus.validationChecks | Where-Object { $_.resultStatus -eq "SUCCEEDED" }).Count
-            $failCount = @($valStatus.validationChecks | Where-Object { $_.resultStatus -eq "FAILED"    }).Count
-            $warnCount = @($valStatus.validationChecks | Where-Object { $_.resultStatus -eq "WARNING"   }).Count
+            # Exclude the "Validating input specification" wrapper -- same filter as Write-ValidationReport
+            $hostChecks = $valStatus.validationChecks | Where-Object {
+                $_.description -notlike "*input specification*" -and
+                $_.description -notlike "*Validating input*"
+            }
+            $passCount = @($hostChecks | Where-Object { $_.resultStatus -eq "SUCCEEDED" }).Count
+            $failCount = @($hostChecks | Where-Object { $_.resultStatus -eq "FAILED"    }).Count
+            $warnCount = @($hostChecks | Where-Object { $_.resultStatus -eq "WARNING"   }).Count
         }
         Write-Host ("=" * 62) -ForegroundColor DarkCyan
         Write-Host "  VALIDATION SUMMARY" -ForegroundColor Cyan
