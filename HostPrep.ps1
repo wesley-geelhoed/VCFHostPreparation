@@ -207,7 +207,8 @@
         3.6.0 - Added Get-ESXiStorageType helper: detects VMFS_FC (FC HBA
                 present) and NFS (NFS datastore mounted); defaults to VSAN
                 for all other hosts; vSAN OSA vs ESA is not auto-detectable
-                on unclaimed hosts and must be overridden manually in
+                on unclaimed hosts -- edit StorageType in the CSV to
+                VSAN_ESA or VVOL if needed before running
                 Commission-VCFHosts.ps1; detected type written per-host
                 to the commissioning CSV
 #>
