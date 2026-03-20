@@ -73,7 +73,7 @@
 
 .NOTES
     Script  : Commission-VCFHosts.ps1
-    Version : 2.4.0
+    Version : 2.5.0
     Author  : Paul van Dieen
     Blog    : https://www.hollebollevsan.nl
     Date    : 2026-03-20
@@ -151,6 +151,12 @@
                 flatten functions (Get-FlatChecks, Flatten-Checks) that were
                 scoped inside other functions and caused "not recognized"
                 errors at runtime
+        2.5.0 - Per-host summary table now shows actual resultStatus (PASS/
+                FAIL/WARN) from the matched check object rather than inferring
+                pass/fail from extracted failure messages; hosts that passed
+                their spec check but failed the overall validation now show
+                correctly; message detail shown in appropriate colour per
+                status; column renamed from "Issues" to "Validation Result"
 #>
 
 [CmdletBinding()]
@@ -187,7 +193,7 @@ param (
 
 $ScriptMeta = @{
     Name    = "Commission-VCFHosts.ps1"
-    Version = "2.4.0"
+    Version = "2.5.0"
     Author  = "Paul van Dieen"
     Blog    = "https://www.hollebollevsan.nl"
     Date    = "2026-03-20"
@@ -596,77 +602,67 @@ function Write-ValidationReport {
         }
     }
 
-    # ── Build per-host failure summary ─────────────────────────────────────
-    # Walk all checks and nested checks to collect failures keyed by host FQDN.
-    # SDDC Manager typically embeds the host FQDN in nested check descriptions
-    # or in a dedicated fqdn/hostname property on the nested check object.
-    $hostFailureMap = @{}  # FQDN -> list of failure strings
-    foreach ($h in $Hosts) { $hostFailureMap[$h.FQDN] = [System.Collections.Generic.List[string]]::new() }
+    # ── Build per-host summary ────────────────────────────────────────────
+    # Match each host FQDN to its leaf check from the flattened check list.
+    # Use the actual resultStatus from the matched check object -- not inferred
+    # from whether failure messages were extracted -- so hosts that passed their
+    # spec check but failed for another reason are shown accurately.
+    $leafChecks = Get-AllLeafChecks $ValidationStatus.validationChecks
 
-    function Collect-HostFailures ($obj, $depth) {
-        if ($depth -gt 4) { return }
-
-        # For VCF 9: top-level validationChecks have one entry per host.
-        # The check description is "Validating host <fqdn>" and errorResponse
-        # contains context.fqdn + message. Handle these directly first.
-        $directFqdn = Get-CheckFqdn $obj
-        if (-not $directFqdn) {
-            # Try matching description "Validating host <fqdn>"
-            foreach ($fqdn in $hostFailureMap.Keys) {
-                if ($obj.PSObject.Properties["description"] -and $obj.description -like "*$fqdn*") {
-                    $directFqdn = $fqdn; break
+    # Build FQDN -> check object map
+    $hostCheckMap = @{}
+    foreach ($h in $Hosts) { $hostCheckMap[$h.FQDN] = $null }
+    foreach ($c in $leafChecks) {
+        $fqdn = Get-CheckFqdn $c
+        if (-not $fqdn) {
+            foreach ($f in $hostCheckMap.Keys) {
+                if ($c.PSObject.Properties["description"] -and $c.description -like "*$f*") {
+                    $fqdn = $f; break
                 }
             }
         }
-        if ($directFqdn -and $hostFailureMap.ContainsKey($directFqdn) -and
-            $obj.PSObject.Properties["resultStatus"] -and
-            $obj.resultStatus -in @("FAILED","WARNING")) {
-            $msgs = Get-CheckMessages $obj
-            $detail = if ($msgs.Count -gt 0) { $msgs[0] } else { [System.Web.HttpUtility]::HtmlEncode($obj.description) }
-            if ($hostFailureMap[$directFqdn] -notcontains $detail) {
-                $hostFailureMap[$directFqdn].Add($detail)
-            }
-        }
-
-        # Recurse into nested check arrays
-        foreach ($np in @("nestedValidationChecks","nestedChecks","validationChecks","checkItems")) {
-            if ($obj.PSObject.Properties[$np] -and $obj.$np) {
-                foreach ($n in $obj.$np) {
-                    Collect-HostFailures $n ($depth + 1)
-                }
-                break
-            }
-        }
-    }
-
-    if ($ValidationStatus -and $ValidationStatus.PSObject.Properties["validationChecks"]) {
-        foreach ($check in $ValidationStatus.validationChecks) {
-            Collect-HostFailures $check 0
+        if ($fqdn -and $hostCheckMap.ContainsKey($fqdn) -and -not $hostCheckMap[$fqdn]) {
+            $hostCheckMap[$fqdn] = $c
         }
     }
 
     # Build per-host rows
     $hostRows = ""
     foreach ($h in $Hosts) {
-        $failures = $hostFailureMap[$h.FQDN]
-        $hostStatus = if ($failures -and $failures.Count -gt 0) {
-            "<span style='color:#f85149'>&#10008; Issues found</span>"
-        } else {
-            "<span style='color:#3fb950'>&#10004; No issues detected</span>"
-        }
-        $failureDetail = if ($failures -and $failures.Count -gt 0) {
-            "<ul style='margin:4px 0 0 0;padding-left:16px;color:#f85149;font-size:0.8rem'>" +
-            ($failures | ForEach-Object { "<li>$_</li>" }) -join "" +
-            "</ul>"
-        } else { "" }
+        $check    = $hostCheckMap[$h.FQDN]
+        $status   = if ($check) { $check.resultStatus } else { "UNKNOWN" }
+        $msgs     = if ($check) { Get-CheckMessages $check } else { [System.Collections.Generic.List[string]]::new() }
 
-        $rowClass = if ($failures -and $failures.Count -gt 0) { "fail" } else { "ok" }
+        $rowClass = switch ($status) {
+            "SUCCEEDED" { "ok"   }
+            "FAILED"    { "fail" }
+            "WARNING"   { "warn" }
+            default     { ""     }
+        }
+        $statusBadge = switch ($status) {
+            "SUCCEEDED" { "<span style='color:#3fb950'>&#10004; PASS</span>" }
+            "FAILED"    { "<span style='color:#f85149'>&#10008; FAIL</span>" }
+            "WARNING"   { "<span style='color:#d29922'>&#9888; WARN</span>"  }
+            default     { "<span style='color:#8b949e'>&#9679; $([System.Web.HttpUtility]::HtmlEncode($status))</span>" }
+        }
+
+        $msgColor  = if ($status -eq "SUCCEEDED") { "#8b949e" } else { "#f85149" }
+        $msgDetail = if ($msgs.Count -gt 0) {
+            "<ul style='margin:4px 0 0 0;padding-left:16px;color:$msgColor;font-size:0.8rem'>" +
+            ($msgs | ForEach-Object { "<li>$_</li>" }) -join "" +
+            "</ul>"
+        } elseif ($status -eq "SUCCEEDED") {
+            "<div style='margin-top:4px;color:#8b949e;font-size:0.8rem'>No issues detected</div>"
+        } else {
+            "<div style='margin-top:4px;color:#f85149;font-size:0.8rem'>No detail available -- check ValidationResponse.json</div>"
+        }
+
         $hostRows += "
         <tr class='$rowClass'>
             <td>$([System.Web.HttpUtility]::HtmlEncode($h.FQDN))</td>
             <td style='font-family:Consolas,monospace;font-size:0.72rem;color:#79c0ff;word-break:break-all'>$([System.Web.HttpUtility]::HtmlEncode($h.Thumbprint))</td>
             <td>$([System.Web.HttpUtility]::HtmlEncode($h.StorageType))</td>
-            <td>$hostStatus$failureDetail</td>
+            <td>$statusBadge$msgDetail</td>
         </tr>"
     }
 
@@ -751,7 +747,7 @@ function Write-ValidationReport {
       <th>Host FQDN</th>
       <th>Thumbprint</th>
       <th>Storage Type</th>
-      <th>Issues</th>
+      <th>Validation Result</th>
     </tr>
   </thead>
   <tbody>
