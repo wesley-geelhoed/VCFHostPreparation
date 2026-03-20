@@ -115,7 +115,7 @@
 
 .NOTES
     Script  : Commission-VCFHosts.ps1
-    Version : 2.6.0
+    Version : 2.7.0
     Author  : Paul van Dieen
     Blog    : https://www.hollebollevsan.nl
     Date    : 2026-03-20
@@ -206,6 +206,10 @@
                 matching "succeeded/success/passed" are treated as failures;
                 passing hosts whose batch failed due to another host now show
                 correctly as PASS with informational message in grey
+        2.7.0 - Moved Get-CheckMessages, Get-CheckFqdn and Render-NestedChecks
+                to Helper Functions region; they were scoped inside
+                Write-ValidationReport and caused "not recognized" errors
+                when called from the validation and count logic outside it
 #>
 
 [CmdletBinding()]
@@ -242,7 +246,7 @@ param (
 
 $ScriptMeta = @{
     Name    = "Commission-VCFHosts.ps1"
-    Version = "2.6.0"
+    Version = "2.7.0"
     Author  = "Paul van Dieen"
     Blog    = "https://www.hollebollevsan.nl"
     Date    = "2026-03-20"
@@ -430,6 +434,53 @@ function Get-CommissionedHostIds {
     return $idMap
 }
 
+function Get-CheckMessages {
+    <#
+    .SYNOPSIS
+        Collects all message strings from an SDDC Manager check object.
+        Checks flat properties first, then errorResponse.message (VCF 9 structure).
+    #>
+    param ([object]$obj)
+
+    $list = [System.Collections.Generic.List[string]]::new()
+    foreach ($p in @("errorMessage","message","resultMessage")) {
+        if ($obj.PSObject.Properties[$p] -and $obj.$p) {
+            $list.Add([System.Web.HttpUtility]::HtmlEncode($obj.$p))
+        }
+    }
+    # SDDC Manager VCF 9 nests the message under errorResponse.message
+    if ($obj.PSObject.Properties["errorResponse"] -and $obj.errorResponse) {
+        if ($obj.errorResponse.PSObject.Properties["message"] -and $obj.errorResponse.message) {
+            $list.Add([System.Web.HttpUtility]::HtmlEncode($obj.errorResponse.message))
+        }
+    }
+    return $list
+}
+
+function Get-CheckFqdn {
+    <#
+    .SYNOPSIS
+        Extracts the host FQDN from an SDDC Manager check object.
+        Checks flat fqdn/hostname properties, then errorResponse.context.fqdn (VCF 9).
+    #>
+    param ([object]$obj)
+
+    foreach ($fp in @("fqdn","hostname","hostName","host")) {
+        if ($obj.PSObject.Properties[$fp] -and $obj.$fp) { return $obj.$fp }
+    }
+    # SDDC Manager VCF 9 puts the fqdn under errorResponse.context.fqdn
+    if ($obj.PSObject.Properties["errorResponse"] -and $obj.errorResponse) {
+        if ($obj.errorResponse.PSObject.Properties["context"] -and $obj.errorResponse.context) {
+            foreach ($fp in @("fqdn","hostname","hostName","host")) {
+                if ($obj.errorResponse.context.PSObject.Properties[$fp] -and $obj.errorResponse.context.$fp) {
+                    return $obj.errorResponse.context.$fp
+                }
+            }
+        }
+    }
+    return $null
+}
+
 function Get-AllLeafChecks {
     <#
     .SYNOPSIS
@@ -451,6 +502,39 @@ function Get-AllLeafChecks {
         if (-not $hasNested) { $result.Add($c) }
     }
     return $result
+}
+
+function Render-NestedChecks {
+    <#
+    .SYNOPSIS
+        Recursively renders nested SDDC Manager validation checks as an HTML list.
+    #>
+    param ([object]$parentObj)
+
+    $html = ""
+    foreach ($np in @("nestedValidationChecks","nestedChecks","validationChecks","checkItems")) {
+        if ($parentObj.PSObject.Properties[$np] -and $parentObj.$np) {
+            $html += "<ul style='margin:6px 0 0 0;padding-left:16px;list-style:none'>"
+            foreach ($n in $parentObj.$np) {
+                $nIcon = switch ($n.resultStatus) {
+                    "SUCCEEDED" { "<span style='color:#3fb950'>&#10004;</span>" }
+                    "FAILED"    { "<span style='color:#f85149'>&#10008;</span>" }
+                    "WARNING"   { "<span style='color:#d29922'>&#9888;</span>"  }
+                    default     { "<span style='color:#8b949e'>&#9679;</span>"  }
+                }
+                $nMsgs    = Get-CheckMessages $n
+                $nMsgHtml = if ($nMsgs.Count -gt 0) {
+                    "<span style='color:#8b949e;font-size:0.78rem'> -- " + ($nMsgs -join "; ") + "</span>"
+                } else { "" }
+                $html += "<li style='padding:2px 0'>$nIcon $([System.Web.HttpUtility]::HtmlEncode($n.description))$nMsgHtml"
+                $html += Render-NestedChecks $n
+                $html += "</li>"
+            }
+            $html += "</ul>"
+            break  # only process the first matching property per level
+        }
+    }
+    return $html
 }
 
 function Write-CommissionSummary {
@@ -564,71 +648,6 @@ function Write-ValidationReport {
                 $passCount++
             }
         }
-    }
-
-    # ── Helper: collect all messages from a check object ──────────────────
-    # Checks flat properties first, then errorResponse.message (SDDC Manager v9 structure)
-    function Get-CheckMessages ($obj) {
-        $list = [System.Collections.Generic.List[string]]::new()
-        foreach ($p in @("errorMessage","message","resultMessage")) {
-            if ($obj.PSObject.Properties[$p] -and $obj.$p) {
-                $list.Add([System.Web.HttpUtility]::HtmlEncode($obj.$p))
-            }
-        }
-        # SDDC Manager VCF 9 nests the message under errorResponse.message
-        if ($obj.PSObject.Properties["errorResponse"] -and $obj.errorResponse) {
-            if ($obj.errorResponse.PSObject.Properties["message"] -and $obj.errorResponse.message) {
-                $list.Add([System.Web.HttpUtility]::HtmlEncode($obj.errorResponse.message))
-            }
-        }
-        return $list
-    }
-
-    # ── Helper: extract FQDN from a check object ───────────────────────────
-    # Checks flat fqdn/hostname properties, then errorResponse.context.fqdn
-    function Get-CheckFqdn ($obj) {
-        foreach ($fp in @("fqdn","hostname","hostName","host")) {
-            if ($obj.PSObject.Properties[$fp] -and $obj.$fp) { return $obj.$fp }
-        }
-        # SDDC Manager VCF 9 puts the fqdn under errorResponse.context.fqdn
-        if ($obj.PSObject.Properties["errorResponse"] -and $obj.errorResponse) {
-            if ($obj.errorResponse.PSObject.Properties["context"] -and $obj.errorResponse.context) {
-                foreach ($fp in @("fqdn","hostname","hostName","host")) {
-                    if ($obj.errorResponse.context.PSObject.Properties[$fp] -and $obj.errorResponse.context.$fp) {
-                        return $obj.errorResponse.context.$fp
-                    }
-                }
-            }
-        }
-        return $null
-    }
-
-    # ── Helper: recursively render nested checks as HTML ──────────────────
-    function Render-NestedChecks ($parentObj) {
-        $html = ""
-        foreach ($np in @("nestedValidationChecks","nestedChecks","validationChecks","checkItems")) {
-            if ($parentObj.PSObject.Properties[$np] -and $parentObj.$np) {
-                $html += "<ul style='margin:6px 0 0 0;padding-left:16px;list-style:none'>"
-                foreach ($n in $parentObj.$np) {
-                    $nIcon = switch ($n.resultStatus) {
-                        "SUCCEEDED" { "<span style='color:#3fb950'>&#10004;</span>" }
-                        "FAILED"    { "<span style='color:#f85149'>&#10008;</span>" }
-                        "WARNING"   { "<span style='color:#d29922'>&#9888;</span>"  }
-                        default     { "<span style='color:#8b949e'>&#9679;</span>"  }
-                    }
-                    $nMsgs = Get-CheckMessages $n
-                    $nMsgHtml = if ($nMsgs.Count -gt 0) {
-                        "<span style='color:#8b949e;font-size:0.78rem'> -- " + ($nMsgs -join "; ") + "</span>"
-                    } else { "" }
-                    $html += "<li style='padding:2px 0'>$nIcon $([System.Web.HttpUtility]::HtmlEncode($n.description))$nMsgHtml"
-                    $html += Render-NestedChecks $n
-                    $html += "</li>"
-                }
-                $html += "</ul>"
-                break  # only process the first matching property per level
-            }
-        }
-        return $html
     }
 
     # ── Build check rows ───────────────────────────────────────────────────
