@@ -126,7 +126,7 @@
 
 .NOTES
     Script  : HostPrep.ps1
-    Version : 3.7.2
+    Version : 3.7.0
     Author  : Paul van Dieen
     Blog    : https://www.hollebollevsan.nl
     Date    : 2026-03-20
@@ -216,16 +216,6 @@
                 Write-Host and Write-Warning calls converted to Write-Log;
                 log file defaults to script directory (same as report and
                 CSV); -NoNewline console-only calls produce no log entry
-        3.7.1 - Log Posh-SSH version on import for easier diagnostics; added
-                5-second delay after enabling SSH to allow sshd to start
-                before connecting; SSH key exchange failures now produce a
-                specific error message directing the user to Update-Module
-                Posh-SSH and noting ESXi FIPS mode as a potential cause
-        3.7.2 - Fixed reboot not executing after certificate regeneration:
-                removed unnecessary Disconnect-VIServer/Connect-VIServer
-                before Restart-VMHost; the new certificate only takes effect
-                after reboot so the existing session is still valid and the
-                reconnect was silently failing, swallowing the reboot call
 #>
 
 [CmdletBinding()]
@@ -256,7 +246,7 @@ param (
 
 $ScriptMeta = @{
     Name    = "HostPrep.ps1"
-    Version = "3.7.2"
+    Version = "3.7.0"
     Author  = "Paul van Dieen"
     Blog    = "https://www.hollebollevsan.nl"
     Date    = "2026-03-20"
@@ -422,8 +412,6 @@ if (-not $WhatIfReport) {
     } else {
         Import-Module Posh-SSH -ErrorAction Stop
         $script:PoshSSHAvailable = $true
-        $poshSshVer = (Get-Module Posh-SSH).Version.ToString()
-        Write-Log "  Posh-SSH $poshSshVer loaded." -Color DarkGray
     }
 }
 
@@ -632,25 +620,13 @@ function Invoke-ESXiCertificateRegen {
     # Enable SSH temporarily
     Write-Log "  Enabling SSH temporarily for certificate regeneration..." -Level WARN
     Set-VMHostServiceConfig -VMHost $VMHostObj -ServiceKey "TSM-SSH"
-    Start-Sleep -Seconds 5   # allow sshd to fully start before connecting
 
     $sshSession = $null
     try {
         # Connect via SSH
         Write-Log "  Connecting via SSH to run /sbin/generate-certificates..."
-        try {
-            $sshSession = New-SSHSession -ComputerName $VMHost -Credential $Credential `
-                            -AcceptKey -ErrorAction Stop
-        } catch {
-            if ($_ -match 'Key exchange') {
-                throw "SSH key exchange negotiation failed connecting to $VMHost. " +
-                      "This is typically a Posh-SSH/SSH.NET version issue. " +
-                      "Run: Update-Module Posh-SSH  then retry. " +
-                      "If ESXi FIPS mode is enabled, SSH may be restricted to specific algorithms. " +
-                      "Original error: $_"
-            }
-            throw
-        }
+        $sshSession = New-SSHSession -ComputerName $VMHost -Credential $Credential `
+                        -AcceptKey -ErrorAction Stop
 
         $sshResult = Invoke-SSHCommand -SessionId $sshSession.SessionId `
                         -Command "/sbin/generate-certificates" -ErrorAction Stop
@@ -1549,10 +1525,14 @@ foreach ($esxiHost in $targetEsxiHosts) {
                     if ($certRegenSuccess) {
                         $hostResult.CertRegen = "OK"
 
-                        # Issue reboot using the existing connection -- the new certificate
-                        # only takes effect after the reboot, so the current session is still valid.
-                        Write-Log "  Initiating reboot of $esxiHost..." -Level WARN
-                        Restart-VMHost -VMHost $vmHostObj -Confirm:$false -Force -ErrorAction Stop | Out-Null
+                        # Disconnect cleanly before reboot
+                        Disconnect-VIServer -Server $esxiHost -Confirm:$false -ErrorAction SilentlyContinue
+                        Write-Log "  Disconnected. Initiating reboot of $esxiHost..." -Level WARN
+
+                        # Reconnect temporarily to issue the reboot command
+                        Connect-VIServer -Server $esxiHost -Credential $esxiCredentials -ErrorAction Stop | Out-Null
+                        $rebootHostObj = Get-VMHost -Name $esxiHost -ErrorAction Stop
+                        Restart-VMHost -VMHost $rebootHostObj -Confirm:$false -Force -ErrorAction Stop | Out-Null
                         Disconnect-VIServer -Server $esxiHost -Confirm:$false -ErrorAction SilentlyContinue
                         Write-Log "  Reboot issued. Waiting for host to come back online..." -Level WARN
 
