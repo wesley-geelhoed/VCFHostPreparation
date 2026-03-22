@@ -126,7 +126,7 @@
 
 .NOTES
     Script  : HostPrep.ps1
-    Version : 3.7.0
+    Version : 3.7.1
     Author  : Paul van Dieen
     Blog    : https://www.hollebollevsan.nl
     Date    : 2026-03-20
@@ -211,6 +211,9 @@
                 VSAN_ESA or VVOL if needed before running
                 Commission-VCFHosts.ps1; detected type written per-host
                 to the commissioning CSV
+        3.7.1 - After cert regen and reboot, re-check CN vs FQDN; if still
+                mismatched set CertRegen to "CN mismatch" with a WARN log
+                entry and highlight it in red in the HTML report
         3.7.0 - Replaced Start/Stop-Transcript with Write-Log: timestamped
                 INFO/WARN/ERROR entries written to the log file; all
                 Write-Host and Write-Warning calls converted to Write-Log;
@@ -246,7 +249,7 @@ param (
 
 $ScriptMeta = @{
     Name    = "HostPrep.ps1"
-    Version = "3.7.0"
+    Version = "3.7.1"
     Author  = "Paul van Dieen"
     Blog    = "https://www.hollebollevsan.nl"
     Date    = "2026-03-20"
@@ -1064,6 +1067,7 @@ function Write-HtmlReport {
                 elseif ($row.CertRegen -eq 'Skipped')               { 'Not needed' }
                 elseif ($row.CertRegen -eq 'Manual')                { 'Manual required' }
                 elseif ($row.CertRegen -eq 'Regen needed')          { '<span class=expiry-warn>Regen needed</span>' }
+                elseif ($row.CertRegen -eq 'CN mismatch')           { '<span class=expiry-critical>CN mismatch after regen</span>' }
                 else                                                 { [System.Web.HttpUtility]::HtmlEncode($row.CertRegen) }
             )</td>
             <td>$(
@@ -1546,11 +1550,16 @@ foreach ($esxiHost in $targetEsxiHosts) {
                         $vmHostObj = Get-VMHost -Name $esxiHost -ErrorAction Stop
                         Write-Log "  Reconnected to $esxiHost." -Color Green
 
-                        # Re-read thumbprint from the newly regenerated certificate
+                        # Re-read cert -- verify CN now matches and capture new thumbprint
                         Write-Log "  Reading new certificate thumbprint..."
                         $newCertCheck = Test-ESXiCertificateNeedsRegen -VMHost $esxiHost
                         $hostResult.Thumbprint = $newCertCheck.Thumbprint
                         $hostResult.Expiry     = $newCertCheck.Expiry
+                        if ($newCertCheck.NeedsRegen) {
+                            $hostResult.CertRegen = "CN mismatch"
+                            Write-Log "  WARNING: Certificate CN still does not match hostname after regeneration." -Level WARN
+                            Write-Log "  CN: $($newCertCheck.CN)  --  Expected: $esxiHost" -Level WARN
+                        }
                     }
                 }
             }
