@@ -126,7 +126,7 @@
 
 .NOTES
     Script  : HostPrep.ps1
-    Version : 3.7.2
+    Version : 3.7.3
     Author  : Paul van Dieen
     Blog    : https://www.hollebollevsan.nl
     Date    : 2026-03-20
@@ -211,6 +211,11 @@
                 VSAN_ESA or VVOL if needed before running
                 Commission-VCFHosts.ps1; detected type written per-host
                 to the commissioning CSV
+        3.7.3 - Before cert regen, compare ESXi configured hostname (via
+                Get-VMHostNetwork) to the FQDN from the hosts file; if they
+                differ, skip regen and flag as CN mismatch immediately --
+                generate-certificates uses the host's own hostname so regen
+                would produce the same wrong CN and the reboot is wasted
         3.7.2 - CN mismatch after cert regen now marks the host as not ready:
                 red in the console summary table, red in the HTML report,
                 and overall row status set to warn so the host is not shown
@@ -253,7 +258,7 @@ param (
 
 $ScriptMeta = @{
     Name    = "HostPrep.ps1"
-    Version = "3.7.2"
+    Version = "3.7.3"
     Author  = "Paul van Dieen"
     Blog    = "https://www.hollebollevsan.nl"
     Date    = "2026-03-20"
@@ -1527,6 +1532,20 @@ foreach ($esxiHost in $targetEsxiHosts) {
                     $hostResult.CertRegen = "Manual"
                     $hostResult.Rebooted  = "Manual"
                 } else {
+                    # Verify the ESXi configured hostname matches the FQDN from the
+                    # hosts file before attempting regen -- generate-certificates uses
+                    # the host's own configured FQDN, so a hostname mismatch means
+                    # regen would produce the same wrong CN and the reboot is wasted.
+                    $hostNet  = Get-VMHostNetwork -VMHost $vmHostObj
+                    $esxiFqdn = "$($hostNet.HostName).$($hostNet.DomainName)".ToLower().TrimEnd('.')
+                    if ($esxiFqdn -ne $esxiHost.ToLower()) {
+                        Write-Log "  ESXi hostname '$esxiFqdn' does not match expected FQDN '$esxiHost'." -Level WARN
+                        Write-Log "  Certificate regeneration skipped: fix the ESXi hostname first or" -Level WARN
+                        Write-Log "  the regenerated certificate will still have the wrong CN." -Level WARN
+                        $hostResult.CertRegen = "CN mismatch"
+                        $hostResult.Rebooted  = "Skipped"
+                    } else {
+
                     $certRegenSuccess = Invoke-ESXiCertificateRegen `
                         -VMHost     $esxiHost `
                         -VMHostObj  $vmHostObj `
@@ -1567,6 +1586,7 @@ foreach ($esxiHost in $targetEsxiHosts) {
                             Write-Log "  CN: $($newCertCheck.CN)  --  Expected: $esxiHost" -Level WARN
                         }
                     }
+                    } # end hostname-matches-fqdn check
                 }
             }
         } catch {
