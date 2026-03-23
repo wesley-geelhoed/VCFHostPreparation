@@ -4,7 +4,7 @@ Two PowerShell scripts that automate ESXi host preparation and commissioning for
 
 | Script | Version | Purpose |
 |---|---|---|
-| `HostPrep.ps1` | 3.6.0 | Prepares ESXi hosts — DNS, NTP, certificates, storage detection, advanced settings, password reset |
+| `HostPrep.ps1` | 4.0.0 | Prepares ESXi hosts — DNS, NTP, certificates, storage detection, disk wipe, advanced settings, password reset |
 | `Commission-VCFHosts.ps1` | 2.9.0 | Commissions prepared hosts into SDDC Manager via the REST API |
 
 Run `HostPrep.ps1` first, then hand the generated CSV to `Commission-VCFHosts.ps1`.
@@ -25,6 +25,7 @@ Reads a plain text file with one ESXi FQDN per line and runs the following steps
 4. **Advanced Settings** — sets `Config.HostAgent.ssl.keyStore.allowSelfSigned = true`, required by SDDC Manager
 5. **Optional Advanced Settings** — applies any extra settings enabled in the `$OptionalAdvancedSettings` block
 6. **Storage type detection** — detects the primary storage type for the commissioning CSV (see below)
+6b. **vSAN disk wipe** *(optional, `-WipeDisk` only)* — enumerates non-boot disks with existing partitions and wipes them via `partedUtil` over SSH, preparing disks for clean vSAN commissioning (see below)
 7. **Certificate regeneration** — reads the TLS certificate from port 443 and checks whether the CN matches the host FQDN. If not: temporarily enables SSH, runs `/sbin/generate-certificates` via Posh-SSH, disables SSH, reboots, waits for the host to return online
 8. **Password reset** *(optional)* — resets the root password to a VCF 9 compliant value; always runs last so the existing credential stays valid throughout
 
@@ -34,6 +35,31 @@ After all hosts are processed:
 - A **commissioning CSV** is saved for use by `Commission-VCFHosts.ps1`
 
 ![HostPrep HTML commissioning report](https://www.hollebollevsan.nl/wp-content/uploads/2026/03/HostPrep-Report-Screenshot.jpg)
+
+### vSAN disk wipe
+
+Use `-WipeDisk` to clean disks on hosts that were previously part of a vSAN cluster before recommissioning them into VCF. The script:
+
+1. Enumerates all storage devices via `esxcli`
+2. Identifies and **unconditionally excludes** the boot disk (`IsBootDrive` flag; falls back to ≤ 8 GB size heuristic if the flag is not set)
+3. Lists all non-boot disks with existing partition tables
+4. Prompts **Y/N** per host before wiping anything
+5. Unmounts any VMFS datastores on target disks, then wipes partition tables via SSH: `partedUtil mklabel <device> gpt`
+6. Disables SSH again when done
+
+**Only runs for hosts detected as `VSAN`.** Skipped automatically for `VMFS_FC` and `NFS` hosts.
+
+Requires Posh-SSH. Without it the script prints per-host manual SSH instructions instead of failing.
+
+```powershell
+# Wipe vSAN disks during host prep
+.\HostPrep.ps1 -WipeDisk
+
+# Dry run -- shows which disks would be wiped, no changes made
+.\HostPrep.ps1 -WipeDisk -DryRun
+```
+
+> **Boot disk is always protected.** It is excluded at enumeration time and never reaches `partedUtil` regardless of the Y/N answer.
 
 ### Storage type detection
 
@@ -53,7 +79,7 @@ After connecting to each host, `HostPrep.ps1` detects the storage type and write
 |---|---|
 | PowerShell 5.1 | Included with Windows 10 / Server 2016 and later |
 | VMware PowerCLI | `Install-Module -Name VMware.PowerCLI -Scope CurrentUser` |
-| Posh-SSH | Optional — required for automated cert regen. `Install-Module -Name Posh-SSH -Scope CurrentUser` |
+| Posh-SSH | Optional — required for automated cert regen and `-WipeDisk`. `Install-Module -Name Posh-SSH -Scope CurrentUser` |
 
 One-time PowerCLI setup (run once per user account):
 
@@ -61,7 +87,7 @@ One-time PowerCLI setup (run once per user account):
 Set-PowerCLIConfiguration -Scope User -ParticipateInCEIP $false -Confirm:$false
 ```
 
-Without Posh-SSH the script prints per-host manual instructions for the certificate step.
+Without Posh-SSH the script prints per-host manual instructions for the certificate and disk wipe steps.
 
 ### Usage
 
@@ -77,6 +103,12 @@ Without Posh-SSH the script prints per-host manual instructions for the certific
 
 # Collect thumbprints and generate report/CSV without making any changes
 .\HostPrep.ps1 -WhatIfReport
+
+# Wipe vSAN disks during prep (prompts Y/N per host)
+.\HostPrep.ps1 -WipeDisk
+
+# Dry run with disk wipe simulation
+.\HostPrep.ps1 -WipeDisk -DryRun
 ```
 
 ### Parameters
@@ -88,6 +120,7 @@ Without Posh-SSH the script prints per-host manual instructions for the certific
 | `-WhatIfReport` | `switch` | — | Read thumbprints and generate report/CSV without changes |
 | `-LogPath` | `string` | Desktop | Path for the transcript log |
 | `-ReportPath` | `string` | Next to script | Path for the HTML commissioning report |
+| `-WipeDisk` | `switch` | — | Wipe non-boot partitioned disks on VSAN hosts via SSH before cert regen |
 | `-CsvPath` | `string` | Next to script | Path for the commissioning CSV |
 
 ### Host list file
