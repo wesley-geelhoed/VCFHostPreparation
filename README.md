@@ -240,6 +240,12 @@ Full write-up with background and screenshots:
 
 ---
 
+## Next step
+
+Once your hosts are commissioned into SDDC Manager, use the scripts in [VCFJsonSpecCreators](https://github.com/pauldiee/VCFJsonSpecCreators) to build the JSON payloads for creating network pools, workload domains, and clusters.
+
+---
+
 ## Author
 
 Paul van Dieen — [hollebollevsan.nl](https://www.hollebollevsan.nl)
