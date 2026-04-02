@@ -651,9 +651,10 @@ function Write-ValidationReport {
     # Use the top-level resultStatus from SDDC Manager for the overall result.
     # Do not re-derive from counts -- the wrapper check skews the numbers.
     $overallStatus = switch ($ValidationStatus.resultStatus) {
-        "FAILED"  { "FAILED"  }
-        "WARNING" { "WARNING" }
-        default   { "PASSED"  }
+        "FAILED"    { "FAILED"  }
+        "WARNING"   { "WARNING" }
+        "SUCCEEDED" { "PASSED"  }
+        default     { "UNKNOWN" }
     }
 
     if ($ValidationStatus -and $ValidationStatus.PSObject.Properties["validationChecks"]) {
