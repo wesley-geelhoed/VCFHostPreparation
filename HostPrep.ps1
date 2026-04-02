@@ -17,6 +17,10 @@
          vs ESA cannot be auto-detected on unclaimed hosts -- edit the
          StorageType column in the CSV before running Commission-VCFHosts.ps1
          if VSAN_ESA or VVOL is intended
+      6b. vSAN disk wipe (optional, -WipeDisk only)  --  enumerates non-boot
+         disks with existing partitions and wipes them via partedUtil over SSH,
+         preparing disks for clean vSAN commissioning. Requires Posh-SSH.
+         Boot disk is always excluded. Skipped for VMFS_FC and NFS hosts.
       7. Certificate regeneration  --  check CN vs FQDN; if mismatched, enable
          SSH temporarily, run /sbin/generate-certificates via Posh-SSH, disable
          SSH, reboot, and wait for the host to return online
@@ -112,6 +116,14 @@
     Path for the commissioning CSV consumed by Commission-VCFHosts.ps1.
     Defaults to the script folder: HostPrep_<timestamp>_Commissioning.csv.
 
+.PARAMETER WipeDisk
+    Enumerates non-boot disks with existing partitions on each VSAN host and
+    wipes their partition tables via SSH using partedUtil, preparing them for
+    clean vSAN commissioning. Requires Posh-SSH. Without Posh-SSH the script
+    prints manual SSH instructions per host instead of failing.
+    Boot disk is always excluded unconditionally.
+    Skipped for hosts detected as VMFS_FC or NFS.
+
 .EXAMPLE
     .\HostPrep.ps1
 
@@ -124,9 +136,15 @@
 .EXAMPLE
     .\HostPrep.ps1 -WhatIfReport
 
+.EXAMPLE
+    .\HostPrep.ps1 -WipeDisk
+
+.EXAMPLE
+    .\HostPrep.ps1 -WipeDisk -DryRun
+
 .NOTES
     Script  : HostPrep.ps1
-    Version : 3.7.4
+    Version : 4.0.0
     Author  : Paul van Dieen
     Blog    : https://www.hollebollevsan.nl
     Date    : 2026-03-20
@@ -231,6 +249,15 @@
                 Write-Host and Write-Warning calls converted to Write-Log;
                 log file defaults to script directory (same as report and
                 CSV); -NoNewline console-only calls produce no log entry
+        4.0.0 - Added -WipeDisk switch and Invoke-VSANDiskWipe helper:
+                enumerates non-boot disks with existing partitions via
+                esxcli, prompts Y/N per host, wipes partition tables via
+                partedUtil over SSH; boot disk excluded unconditionally
+                via IsBootDrive flag with size-heuristic fallback; VMFS
+                datastores on target disks are unmounted before wipe;
+                falls back to manual SSH instructions when Posh-SSH is
+                unavailable; DiskWipe column added to summary table and
+                HTML report; Get-CellColor updated to match Skipped*
 #>
 
 [CmdletBinding()]
@@ -254,17 +281,22 @@ param (
     [string]$CsvPath = [System.IO.Path]::Combine(
         $PSScriptRoot,
         "HostPrep_$(Get-Date -Format 'yyyyMMdd_HHmmss')_Commissioning.csv"
-    )
+    ),
+
+    # Enumerate non-boot disks with existing partitions on each VSAN host and
+    # wipe them via partedUtil over SSH. Requires Posh-SSH. Boot disk is always
+    # excluded. Skipped for VMFS_FC and NFS hosts.
+    [switch]$WipeDisk
 )
 
 #region --- Script Metadata ---
 
 $ScriptMeta = @{
     Name    = "HostPrep.ps1"
-    Version = "3.7.4"
+    Version = "4.0.0"
     Author  = "Paul van Dieen"
     Blog    = "https://www.hollebollevsan.nl"
-    Date    = "2026-03-20"
+    Date    = "2026-03-23"
 }
 
 #endregion
@@ -397,6 +429,16 @@ if ($DryRun) {
     Write-Log "  *** DRY RUN MODE - No changes will be made ***" -Level WARN
     Write-Log ("  " + $ScriptMeta.Blog) -Color DarkGray
     Write-Log ""
+}
+
+if ($WipeDisk) {
+    Write-Host "  *** DISK WIPE MODE ENABLED -- non-boot partitioned disks will be wiped ***" -ForegroundColor Red
+    Write-Host "  Only applies to hosts detected as VSAN storage type." -ForegroundColor Yellow
+    Write-Host "  Boot disk is always excluded." -ForegroundColor Yellow
+    if ($DryRun) {
+        Write-Host "  (DryRun is active -- no actual wipes will occur)" -ForegroundColor DarkYellow
+    }
+    Write-Host ""
 }
 
 if ($WhatIfReport) {
@@ -834,7 +876,7 @@ function Reset-ESXiAccountPassword {
 function Get-CellColor ($value) {
     if ($value -eq $true  -or $value -eq "OK")        { return "Green"    }
     if ($value -eq $false -or $value -like "FAILED*")  { return "Red"      }
-    if ($value -eq "Skipped")                          { return "DarkGray" }
+    if ($value -like "Skipped*")                       { return "DarkGray" }
     if ($value -eq "Manual")                           { return "Yellow"   }
     if ($value -eq "Partial")                          { return "Yellow"   }
     if ($value -eq "Timeout")                          { return "Red"      }
@@ -955,6 +997,245 @@ function Get-ESXiStorageType {
 }
 
 
+function Invoke-VSANDiskWipe {
+    <#
+    .SYNOPSIS
+        Identifies and wipes non-boot disks with existing partitions on an
+        ESXi host, preparing them for clean vSAN commissioning.
+
+    .DESCRIPTION
+        - Enumerates all storage devices via esxcli v2
+        - Identifies the boot device (IsBootDrive flag; size heuristic fallback)
+          and excludes it unconditionally
+        - Lists non-boot disks that have existing partition tables
+        - Prompts Y/N before wiping
+        - Unmounts any VMFS datastores on target disks before wiping
+        - Wipes partition tables via SSH using: partedUtil mklabel <device> gpt
+        - Falls back to printing manual SSH instructions if Posh-SSH is unavailable
+
+    .PARAMETER VMHost
+        FQDN of the ESXi host (string, used for SSH connection).
+
+    .PARAMETER VMHostObj
+        VMHost object returned by Get-VMHost, used for PowerCLI operations.
+
+    .PARAMETER Credential
+        PSCredential for the root account, used to authenticate the SSH session.
+
+    .PARAMETER DryRun
+        Simulates the wipe without making any changes.
+
+    .OUTPUTS
+        PSCustomObject with:
+          .Status      [string] - "OK", "Partial", "FAILED: <msg>", "Manual",
+                                  "Skipped (clean)", or "Skipped (operator)"
+          .WipedCount  [int]    - number of disks successfully wiped
+          .FailedDisks [string[]] - device names that failed
+    #>
+    param (
+        [Parameter(Mandatory)][string]$VMHost,
+        [Parameter(Mandatory)]$VMHostObj,
+        [Parameter(Mandatory)][System.Management.Automation.PSCredential]$Credential,
+        [switch]$DryRun
+    )
+
+    $esxCli = Get-EsxCli -VMHost $VMHostObj -V2
+
+    # --- Enumerate all storage devices ---
+    try {
+        $allDevices = $esxCli.storage.core.device.list.Invoke()
+    } catch {
+        Write-Warning "  Could not enumerate storage devices: $_"
+        return [PSCustomObject]@{ Status = "FAILED: $_"; WipedCount = 0; FailedDisks = @() }
+    }
+
+    # --- Identify boot device(s) ---
+    $bootDevices = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+
+    # Layer 1: IsBootDrive flag (reliable on ESXi 7+/8+)
+    foreach ($dev in $allDevices) {
+        if ($dev.IsBootDrive -eq $true) {
+            $bootDevices.Add($dev.Device) | Out-Null
+        }
+    }
+
+    # Layer 2: Size heuristic fallback -- USB/SD boot media is typically <= 8 GB.
+    # Only used when Layer 1 found nothing (e.g. older ESXi or flag not set).
+    if ($bootDevices.Count -eq 0) {
+        Write-Host "  IsBootDrive flag not set -- using size heuristic (<=8 GB) for boot disk detection." -ForegroundColor DarkGray
+        foreach ($dev in $allDevices) {
+            if ($dev.Size -le 8192) {   # Size is in MB; 8192 MB = 8 GB
+                $bootDevices.Add($dev.Device) | Out-Null
+            }
+        }
+    }
+
+    Write-Host ("  Boot device(s) excluded from wipe: {0}" -f (
+        if ($bootDevices.Count -gt 0) { ($bootDevices | Sort-Object) -join ', ' } else { 'none detected' }
+    )) -ForegroundColor DarkGray
+
+    # --- Find non-boot disks with existing partition tables ---
+    $disksToWipe = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+    foreach ($dev in $allDevices) {
+        if ($bootDevices.Contains($dev.Device)) { continue }
+
+        try {
+            $partArgs = $esxCli.storage.core.device.partition.list.CreateArgs()
+            $partArgs.device = $dev.Device
+            $partitions = $esxCli.storage.core.device.partition.list.Invoke($partArgs)
+
+            if ($partitions -and @($partitions).Count -gt 0) {
+                $sizeGb = [math]::Round($dev.Size / 1024, 1)
+                $disksToWipe.Add([PSCustomObject]@{
+                    Device  = $dev.Device
+                    Display = $dev.DisplayName
+                    SizeGB  = $sizeGb
+                    IsSSD   = $dev.IsSSD
+                })
+            }
+        } catch {
+            # Device has no partition table or partition query unsupported -- skip
+        }
+    }
+
+    if ($disksToWipe.Count -eq 0) {
+        Write-Host "  All non-boot disks are clean. No wipe needed." -ForegroundColor Green
+        return [PSCustomObject]@{ Status = "Skipped (clean)"; WipedCount = 0; FailedDisks = @() }
+    }
+
+    # --- Display disks and prompt ---
+    Write-Host ""
+    Write-Host ("  Disks with existing partitions on {0}:" -f $VMHost) -ForegroundColor Yellow
+    foreach ($disk in $disksToWipe) {
+        Write-Host ("    {0}  ({1} GB, SSD: {2})" -f $disk.Device, $disk.SizeGB, $disk.IsSSD) -ForegroundColor Yellow
+        Write-Host ("      {0}" -f $disk.Display) -ForegroundColor DarkGray
+    }
+    Write-Host ""
+
+    if ($DryRun) {
+        Write-Host ("  [DRY RUN] Would wipe {0} disk(s) on {1}." -f $disksToWipe.Count, $VMHost) -ForegroundColor DarkYellow
+        return [PSCustomObject]@{ Status = "OK"; WipedCount = $disksToWipe.Count; FailedDisks = @() }
+    }
+
+    $answer = $null
+    while ($answer -notin @('Y', 'N')) {
+        $answer = (Read-Host ("  Wipe {0} disk(s) on {1}? [Y/N]" -f $disksToWipe.Count, $VMHost)).Trim().ToUpper()
+        if ($answer -notin @('Y', 'N')) {
+            Write-Host "  Please enter Y or N." -ForegroundColor Yellow
+        }
+    }
+
+    if ($answer -eq 'N') {
+        Write-Host "  Disk wipe skipped by operator." -ForegroundColor DarkGray
+        return [PSCustomObject]@{ Status = "Skipped (operator)"; WipedCount = 0; FailedDisks = @() }
+    }
+
+    # --- Posh-SSH availability check (soft fail) ---
+    if (-not $script:PoshSSHAvailable) {
+        Write-Host ""
+        Write-Host "  Posh-SSH not available. Cannot run partedUtil via SSH." -ForegroundColor Yellow
+        Write-Host "  ACTION REQUIRED: Manually wipe the following disks on ${VMHost} via SSH:" -ForegroundColor Yellow
+        foreach ($disk in $disksToWipe) {
+            Write-Host ("    partedUtil mklabel /vmfs/devices/disks/{0} gpt" -f $disk.Device) -ForegroundColor Cyan
+        }
+        return [PSCustomObject]@{
+            Status      = "Manual"
+            WipedCount  = 0
+            FailedDisks = @($disksToWipe | Select-Object -ExpandProperty Device)
+        }
+    }
+
+    # --- Unmount any VMFS datastores on the target disks before wiping ---
+    try {
+        $vmfsExtents = $esxCli.storage.vmfs.extent.list.Invoke()
+        foreach ($disk in $disksToWipe) {
+            $extents = $vmfsExtents | Where-Object { $_.DeviceName -eq $disk.Device }
+            foreach ($extent in $extents) {
+                $dsName = $extent.VolumeName
+                $ds = Get-Datastore -VMHost $VMHostObj -Name $dsName -ErrorAction SilentlyContinue
+                if ($ds) {
+                    Write-Host ("  Unmounting VMFS datastore '{0}' from {1}..." -f $dsName, $disk.Device) -ForegroundColor Yellow
+                    Remove-Datastore -Datastore $ds -VMHost $VMHostObj -Confirm:$false -ErrorAction SilentlyContinue
+                    Write-Host ("  Datastore '{0}' removed." -f $dsName) -ForegroundColor Green
+                }
+            }
+        }
+    } catch {
+        Write-Warning "  VMFS extent check failed (non-fatal): $_"
+    }
+
+    # --- Enable SSH temporarily and wipe ---
+    Write-Host "  Enabling SSH temporarily for disk wipe..." -ForegroundColor Yellow
+    Set-VMHostServiceConfig -VMHost $VMHostObj -ServiceKey "TSM-SSH"
+
+    $wipedCount = 0
+    $failedDisks = [System.Collections.Generic.List[string]]::new()
+    $sshSession  = $null
+
+    try {
+        Write-Host "  Connecting via SSH to run partedUtil..." -ForegroundColor Cyan
+        $sshSession = New-SSHSession -ComputerName $VMHost -Credential $Credential -AcceptKey -ErrorAction Stop
+
+        foreach ($disk in $disksToWipe) {
+            try {
+                Write-Host ("  Wiping {0} ({1} GB)..." -f $disk.Device, $disk.SizeGB) -ForegroundColor Yellow
+                $cmd    = "partedUtil mklabel /vmfs/devices/disks/{0} gpt" -f $disk.Device
+                $result = Invoke-SSHCommand -SessionId $sshSession.SessionId -Command $cmd -ErrorAction Stop
+
+                if ($result.ExitStatus -eq 0) {
+                    Write-Host ("  Wiped {0} successfully." -f $disk.Device) -ForegroundColor Green
+                    $wipedCount++
+                } else {
+                    $errMsg = ($result.Output -join ' ').Trim()
+                    Write-Warning ("  partedUtil failed on {0}: {1}" -f $disk.Device, $errMsg)
+                    $failedDisks.Add($disk.Device)
+                }
+            } catch {
+                Write-Warning ("  Failed to wipe {0}: {1}" -f $disk.Device, $_)
+                $failedDisks.Add($disk.Device)
+            }
+        }
+
+    } catch {
+        Write-Warning "  SSH connection failed: $_"
+        return [PSCustomObject]@{
+            Status      = "FAILED: SSH - $_"
+            WipedCount  = 0
+            FailedDisks = @($disksToWipe | Select-Object -ExpandProperty Device)
+        }
+    } finally {
+        if ($sshSession) {
+            Remove-SSHSession -SessionId $sshSession.SessionId -ErrorAction SilentlyContinue | Out-Null
+        }
+        Write-Host "  Disabling SSH..." -ForegroundColor Yellow
+        $svc = Get-VMHostService -VMHost $VMHostObj | Where-Object { $_.Key -eq "TSM-SSH" }
+        if ($svc) {
+            $svc | Set-VMHostService -Policy "off" -Confirm:$false | Out-Null
+            if ($svc.Running) { $svc | Stop-VMHostService -Confirm:$false | Out-Null }
+        }
+        Write-Host "  SSH disabled." -ForegroundColor Green
+    }
+
+    $status = if ($failedDisks.Count -eq 0) {
+        "OK"
+    } elseif ($wipedCount -gt 0) {
+        "Partial"
+    } else {
+        "FAILED"
+    }
+
+    $statusColor = if ($status -eq 'OK') { 'Green' } elseif ($status -eq 'Partial') { 'Yellow' } else { 'Red' }
+    Write-Host ("  Disk wipe complete: {0} wiped, {1} failed." -f $wipedCount, $failedDisks.Count) -ForegroundColor $statusColor
+
+    return [PSCustomObject]@{
+        Status      = $status
+        WipedCount  = $wipedCount
+        FailedDisks = $failedDisks
+    }
+}
+
+
 function Write-ColorSummaryTable {
     param (
         [System.Collections.Generic.List[PSCustomObject]]$Data
@@ -968,6 +1249,7 @@ function Write-ColorSummaryTable {
         NTP              = 6
         AdvancedSettings = 17
         OptionalSettings = 17
+        DiskWipe         = 14
         CertRegen        = 10
         Rebooted         = 10
         PasswordReset    = 15
@@ -1094,6 +1376,14 @@ function Write-HtmlReport {
             <td>$(if ($row.NTP -eq 'OK') { 'OK' } else { [System.Web.HttpUtility]::HtmlEncode($row.NTP) })</td>
             <td>$(if ($row.AdvancedSettings -eq 'OK') { 'OK' } else { [System.Web.HttpUtility]::HtmlEncode($row.AdvancedSettings) })</td>
             <td>$(if ($row.OptionalSettings -eq 'OK') { 'OK' } elseif ($row.OptionalSettings -eq 'Skipped') { '<span style=color:#6e7681>Skipped</span>' } elseif ($row.OptionalSettings -eq 'Partial') { '<span class=expiry-warn>Partial</span>' } else { [System.Web.HttpUtility]::HtmlEncode($row.OptionalSettings) })</td>
+            <td>$(
+                if     ($row.DiskWipe -eq 'OK')                { '<span style="color:#3fb950">Wiped</span>' }
+                elseif ($row.DiskWipe -like 'Skipped*')        { '<span style="color:#6e7681">' + [System.Web.HttpUtility]::HtmlEncode($row.DiskWipe) + '</span>' }
+                elseif ($row.DiskWipe -eq 'Manual')            { '<span class="expiry-warn">Manual required</span>' }
+                elseif ($row.DiskWipe -eq 'Partial')           { '<span class="expiry-warn">Partial</span>' }
+                elseif ($row.DiskWipe -like 'FAILED*')         { '<span style="color:#f85149">' + [System.Web.HttpUtility]::HtmlEncode($row.DiskWipe) + '</span>' }
+                else                                           { [System.Web.HttpUtility]::HtmlEncode($row.DiskWipe) }
+            )</td>
             <td>$(if ($row.PasswordReset -eq 'OK') { 'Reset' } elseif ($row.PasswordReset -eq 'Skipped') { 'Not requested' } else { [System.Web.HttpUtility]::HtmlEncode($row.PasswordReset) })</td>
             <td class='status'>$statusIcon $(if ($row.Error) { [System.Web.HttpUtility]::HtmlEncode($row.Error) } else { '' })</td>
         </tr>"
@@ -1180,6 +1470,7 @@ function Write-HtmlReport {
       <th>NTP</th>
       <th>Advanced Settings</th>
       <th>Optional Settings</th>
+      <th>Disk Wipe</th>
       <th>Password Reset</th>
       <th>Status</th>
     </tr>
@@ -1373,6 +1664,7 @@ foreach ($esxiHost in $targetEsxiHosts) {
         NTP               = "Skipped"
         AdvancedSettings  = "Skipped"
         OptionalSettings  = "Skipped"
+        DiskWipe          = "Skipped"
         CertRegen         = "Skipped"
         Rebooted          = "Skipped"
         PasswordReset     = "Skipped"
@@ -1507,6 +1799,29 @@ foreach ($esxiHost in $targetEsxiHosts) {
                 "Partial"
             } else {
                 "FAILED"
+            }
+        }
+
+        # --- vSAN Disk Wipe ---
+        if ($WipeDisk) {
+            Write-Host "`n  [vSAN Disk Wipe]" -ForegroundColor Cyan
+            if ($DryRun) {
+                Write-Host "  [DRY RUN] Would check and wipe non-boot partitioned disks on $esxiHost." -ForegroundColor DarkYellow
+                $hostResult.DiskWipe = "OK"
+            } elseif ($hostResult.StorageType -ne 'VSAN') {
+                Write-Host ("  Skipped -- storage type is {0}, not VSAN." -f $hostResult.StorageType) -ForegroundColor DarkGray
+                $hostResult.DiskWipe = "Skipped"
+            } else {
+                try {
+                    $wipeResult = Invoke-VSANDiskWipe `
+                        -VMHost     $esxiHost `
+                        -VMHostObj  $vmHostObj `
+                        -Credential $esxiCredentials
+                    $hostResult.DiskWipe = $wipeResult.Status
+                } catch {
+                    $hostResult.DiskWipe = "FAILED: $_"
+                    Write-Warning "  Disk wipe failed: $_"
+                }
             }
         }
 
@@ -1660,7 +1975,7 @@ foreach ($esxiHost in $targetEsxiHosts) {
 #region --- Summary ---
 
 # Derive summary banner width from column definitions (matches Write-ColorSummaryTable divider)
-$summaryColumnWidths = @(34, 11, 14, 6, 17, 17, 10, 10, 15, 28)
+$summaryColumnWidths = @(34, 11, 14, 6, 17, 17, 14, 10, 10, 15, 28)
 $summaryWidth = ($summaryColumnWidths | Measure-Object -Sum).Sum + ($summaryColumnWidths.Count * 3) + 1
 
 
