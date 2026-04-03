@@ -115,7 +115,7 @@
 
 .NOTES
     Script  : Commission-VCFHosts.ps1
-    Version : 3.1.2
+    Version : 3.1.3
     Author  : Paul van Dieen
     Blog    : https://www.hollebollevsan.nl
     Date    : 2026-04-02
@@ -237,6 +237,9 @@
         3.1.1 - Fixed per-host effective status fallthrough: hosts with
                 UNKNOWN or IN_PROGRESS resultStatus no longer show as PASS;
                 only an explicit SUCCEEDED maps to PASS
+        3.1.3 - Added maintenance mode check before validation: queries each
+                host via ESXi SOAP API; if any are in maintenance mode the
+                user is prompted to exit maintenance mode before proceeding
         3.1.2 - SDDC Manager username prompt now defaults to
                 administrator@vsphere.local; press Enter to accept
 #>
@@ -275,7 +278,7 @@ param (
 
 $ScriptMeta = @{
     Name    = "Commission-VCFHosts.ps1"
-    Version = "3.1.2"
+    Version = "3.1.3"
     Author  = "Paul van Dieen"
     Blog    = "https://www.hollebollevsan.nl"
     Date    = "2026-03-20"
@@ -1114,6 +1117,40 @@ function Write-CommissionReport {
     Write-Host ("  HTML report written to: {0}" -f $Path) -ForegroundColor Cyan
 }
 
+function Invoke-ESXiSoapRequest {
+    <#
+    .SYNOPSIS
+        Makes a SOAP call to an ESXi host /sdk endpoint.
+    .DESCRIPTION
+        Wraps Invoke-WebRequest for ESXi SOAP calls. Pass -CaptureSession on the
+        first (Login) call to capture the session cookie; pass -WebSession on all
+        subsequent calls to reuse it. Returns a hashtable with Xml and Session keys
+        when -CaptureSession is used, otherwise returns the [xml] response directly.
+    #>
+    param(
+        [string]$VMHost,
+        [string]$Body,
+        [Microsoft.PowerShell.Commands.WebRequestSession]$WebSession = $null,
+        [switch]$CaptureSession
+    )
+    $params = @{
+        Uri             = "https://$VMHost/sdk"
+        Method          = "POST"
+        ContentType     = "text/xml; charset=utf-8"
+        Body            = $Body
+        UseBasicParsing = $true
+        ErrorAction     = "Stop"
+    }
+    if ($PSVersionTable.PSVersion.Major -ge 6) { $params['SkipCertificateCheck'] = $true }
+    if ($WebSession)      { $params['WebSession']      = $WebSession }
+    if ($CaptureSession)  { $params['SessionVariable'] = 'EsxiSession' }
+    $resp = Invoke-WebRequest @params
+    if ($CaptureSession) {
+        return @{ Xml = [xml]$resp.Content; Session = $EsxiSession }
+    }
+    return [xml]$resp.Content
+}
+
 
 #endregion
 
@@ -1255,6 +1292,177 @@ Write-Host "  SDDC Manager requires the ESXi root password to commission hosts."
 $esxiPassword = Read-Host "  ESXi root password" -AsSecureString
 $esxiPlain    = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto(
                     [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($esxiPassword))
+
+#endregion
+
+#region --- Maintenance Mode Check ---
+
+Write-Host ""
+Write-Host "  Checking maintenance mode on each host..." -ForegroundColor Cyan
+
+$maintenanceHosts = [System.Collections.Generic.List[string]]::new()
+
+foreach ($h in $hosts) {
+    try {
+        $loginXml = @"
+<?xml version="1.0" encoding="UTF-8"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:vim25="urn:vim25">
+  <soapenv:Body>
+    <vim25:Login>
+      <vim25:_this type="SessionManager">ha-sessionmgr</vim25:_this>
+      <vim25:userName>root</vim25:userName>
+      <vim25:password>$esxiPlain</vim25:password>
+    </vim25:Login>
+  </soapenv:Body>
+</soapenv:Envelope>
+"@
+        $loginResult = Invoke-ESXiSoapRequest -VMHost $h.FQDN -Body $loginXml -CaptureSession
+        $esxiSession = $loginResult.Session
+
+        $queryXml = @"
+<?xml version="1.0" encoding="UTF-8"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:vim25="urn:vim25">
+  <soapenv:Body>
+    <vim25:RetrievePropertiesEx>
+      <vim25:_this type="PropertyCollector">ha-property-collector</vim25:_this>
+      <vim25:specSet>
+        <vim25:propSet>
+          <vim25:type>HostSystem</vim25:type>
+          <vim25:pathSet>runtime.inMaintenanceMode</vim25:pathSet>
+        </vim25:propSet>
+        <vim25:objectSet>
+          <vim25:obj type="HostSystem">ha-host</vim25:obj>
+        </vim25:objectSet>
+      </vim25:specSet>
+      <vim25:options/>
+    </vim25:RetrievePropertiesEx>
+  </soapenv:Body>
+</soapenv:Envelope>
+"@
+        $queryResult = Invoke-ESXiSoapRequest -VMHost $h.FQDN -Body $queryXml -WebSession $esxiSession
+        $inMaintenance = $queryResult.Envelope.Body.RetrievePropertiesExResponse.returnval.objects.propSet.val.'#text'
+
+        if ($inMaintenance -eq 'true') {
+            $maintenanceHosts.Add($h.FQDN)
+            Write-Host "  $($h.FQDN) -- in maintenance mode" -ForegroundColor Yellow
+        } else {
+            Write-Host "  $($h.FQDN) -- OK" -ForegroundColor Green
+        }
+
+        $logoutXml = @"
+<?xml version="1.0" encoding="UTF-8"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:vim25="urn:vim25">
+  <soapenv:Body>
+    <vim25:Logout>
+      <vim25:_this type="SessionManager">ha-sessionmgr</vim25:_this>
+    </vim25:Logout>
+  </soapenv:Body>
+</soapenv:Envelope>
+"@
+        Invoke-ESXiSoapRequest -VMHost $h.FQDN -Body $logoutXml -WebSession $esxiSession | Out-Null
+    }
+    catch {
+        Write-Host "  $($h.FQDN) -- could not check maintenance mode: $_" -ForegroundColor DarkGray
+    }
+}
+
+if ($maintenanceHosts.Count -gt 0) {
+    Write-Host ""
+    Write-Host "  The following host(s) are in maintenance mode:" -ForegroundColor Yellow
+    $maintenanceHosts | ForEach-Object { Write-Host "    $_" -ForegroundColor Yellow }
+    Write-Host ""
+    $exitMaintInput = Read-Host "  Exit maintenance mode on these hosts before proceeding? [Y/N]"
+    if ($exitMaintInput -match '^[Yy]') {
+        foreach ($fqdn in $maintenanceHosts) {
+            Write-Host "  Exiting maintenance mode on $fqdn..." -ForegroundColor Cyan
+            try {
+                $loginXml = @"
+<?xml version="1.0" encoding="UTF-8"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:vim25="urn:vim25">
+  <soapenv:Body>
+    <vim25:Login>
+      <vim25:_this type="SessionManager">ha-sessionmgr</vim25:_this>
+      <vim25:userName>root</vim25:userName>
+      <vim25:password>$esxiPlain</vim25:password>
+    </vim25:Login>
+  </soapenv:Body>
+</soapenv:Envelope>
+"@
+                $loginResult = Invoke-ESXiSoapRequest -VMHost $fqdn -Body $loginXml -CaptureSession
+                $esxiSession = $loginResult.Session
+
+                $exitXml = @"
+<?xml version="1.0" encoding="UTF-8"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:vim25="urn:vim25">
+  <soapenv:Body>
+    <vim25:ExitMaintenanceMode_Task>
+      <vim25:_this type="HostSystem">ha-host</vim25:_this>
+      <vim25:timeout>0</vim25:timeout>
+    </vim25:ExitMaintenanceMode_Task>
+  </soapenv:Body>
+</soapenv:Envelope>
+"@
+                $exitResult = Invoke-ESXiSoapRequest -VMHost $fqdn -Body $exitXml -WebSession $esxiSession
+                $taskMor = $exitResult.Envelope.Body.ExitMaintenanceMode_TaskResponse.returnval.'#text'
+
+                # Poll task until complete
+                $taskDeadline = (Get-Date).AddMinutes(5)
+                $taskState    = $null
+                while ((Get-Date) -lt $taskDeadline) {
+                    Start-Sleep -Seconds 3
+                    $pollXml = @"
+<?xml version="1.0" encoding="UTF-8"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:vim25="urn:vim25">
+  <soapenv:Body>
+    <vim25:RetrievePropertiesEx>
+      <vim25:_this type="PropertyCollector">ha-property-collector</vim25:_this>
+      <vim25:specSet>
+        <vim25:propSet>
+          <vim25:type>Task</vim25:type>
+          <vim25:pathSet>info.state</vim25:pathSet>
+        </vim25:propSet>
+        <vim25:objectSet>
+          <vim25:obj type="Task">$taskMor</vim25:obj>
+        </vim25:objectSet>
+      </vim25:specSet>
+      <vim25:options/>
+    </vim25:RetrievePropertiesEx>
+  </soapenv:Body>
+</soapenv:Envelope>
+"@
+                    $pollResult = Invoke-ESXiSoapRequest -VMHost $fqdn -Body $pollXml -WebSession $esxiSession
+                    $taskState  = $pollResult.Envelope.Body.RetrievePropertiesExResponse.returnval.objects.propSet.val.'#text'
+                    if ($taskState -in 'success', 'error') { break }
+                }
+
+                if ($taskState -eq 'success') {
+                    Write-Host "  $fqdn -- exited maintenance mode." -ForegroundColor Green
+                } else {
+                    Write-Host "  $fqdn -- task ended with state: $taskState" -ForegroundColor Yellow
+                }
+
+                $logoutXml = @"
+<?xml version="1.0" encoding="UTF-8"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:vim25="urn:vim25">
+  <soapenv:Body>
+    <vim25:Logout>
+      <vim25:_this type="SessionManager">ha-sessionmgr</vim25:_this>
+    </vim25:Logout>
+  </soapenv:Body>
+</soapenv:Envelope>
+"@
+                Invoke-ESXiSoapRequest -VMHost $fqdn -Body $logoutXml -WebSession $esxiSession | Out-Null
+            }
+            catch {
+                Write-Host "  $fqdn -- failed to exit maintenance mode: $_" -ForegroundColor Red
+            }
+        }
+    } else {
+        Write-Host "  Proceeding without exiting maintenance mode." -ForegroundColor DarkGray
+    }
+}
+
+Write-Host ""
 
 #endregion
 
