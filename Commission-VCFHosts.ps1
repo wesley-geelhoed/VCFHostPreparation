@@ -115,7 +115,7 @@
 
 .NOTES
     Script  : Commission-VCFHosts.ps1
-    Version : 3.1.0
+    Version : 3.1.1
     Author  : Paul van Dieen
     Blog    : https://www.hollebollevsan.nl
     Date    : 2026-04-02
@@ -219,6 +219,9 @@
                 List[string] indexing behaviour; passing hosts now show PASS
                 badge only with no extra detail; FAIL rows still show the full
                 error message
+        3.1.1 - Fixed per-host effective status fallthrough: hosts with
+                UNKNOWN or IN_PROGRESS resultStatus no longer show as PASS;
+                only an explicit SUCCEEDED maps to PASS
         3.1.0 - Validation timeout increased from 5 to 10 minutes; UNKNOWN
                 resultStatus no longer treated as PASSED -- only SUCCEEDED
                 maps to PASSED; any other status including UNKNOWN now
@@ -270,7 +273,7 @@ param (
 
 $ScriptMeta = @{
     Name    = "Commission-VCFHosts.ps1"
-    Version = "3.1.0"
+    Version = "3.1.1"
     Author  = "Paul van Dieen"
     Blog    = "https://www.hollebollevsan.nl"
     Date    = "2026-03-20"
@@ -780,10 +783,8 @@ function Write-ValidationReport {
             "WARNING"
         } elseif ($check -and $check.resultStatus -eq "SUCCEEDED") {
             "SUCCEEDED"
-        } elseif ($overallFailed -and -not $check) {
-            "UNKNOWN"
         } else {
-            "SUCCEEDED"
+            "UNKNOWN"
         }
 
         $rowClass = switch ($effectiveStatus) {
