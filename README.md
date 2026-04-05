@@ -4,7 +4,7 @@ Two PowerShell scripts that automate ESXi host preparation and commissioning for
 
 | Script | Version | Purpose |
 |---|---|---|
-| `HostPrep.ps1` | 4.0.0 | Prepares ESXi hosts — DNS, NTP, certificates, storage detection, disk wipe, advanced settings, password reset |
+| `HostPrep.ps1` | 4.0.9 | Prepares ESXi hosts — DNS, NTP, certificates, storage detection, disk wipe, advanced settings, password reset |
 | `Commission-VCFHosts.ps1` | 3.1.3 | Commissions prepared hosts into SDDC Manager via the REST API |
 
 Run `HostPrep.ps1` first, then hand the generated CSV to `Commission-VCFHosts.ps1`.
@@ -44,8 +44,9 @@ Use `-WipeDisk` to clean disks on hosts that were previously part of a vSAN clus
 2. Identifies and **unconditionally excludes** the boot disk (`IsBootDrive` flag; falls back to ≤ 8 GB size heuristic if the flag is not set)
 3. Lists all non-boot disks with existing partition tables
 4. Prompts **Y/N** per host before wiping anything
-5. Unmounts any VMFS datastores on target disks, then wipes partition tables via SSH: `partedUtil mklabel <device> gpt`
-6. Disables SSH again when done
+5. Unmounts any VMFS datastores on target disks via SSH (`esxcli storage vmfs unmount`) — no vCenter connection required
+6. Wipes partition tables via SSH: `partedUtil mklabel <device> gpt`
+7. Disables SSH again when done
 
 **Only runs for hosts detected as `VSAN`.** Skipped automatically for `VMFS_FC` and `NFS` hosts.
 

@@ -144,10 +144,10 @@
 
 .NOTES
     Script  : HostPrep.ps1
-    Version : 4.0.0
+    Version : 4.0.9
     Author  : Paul van Dieen
     Blog    : https://www.hollebollevsan.nl
-    Date    : 2026-03-20
+    Date    : 2026-04-05
 
     Changelog:
         1.0.0 - Initial release
@@ -229,26 +229,26 @@
                 VSAN_ESA or VVOL if needed before running
                 Commission-VCFHosts.ps1; detected type written per-host
                 to the commissioning CSV
-        3.7.4 - CN mismatch (both pre-regen hostname check and post-regen
-                verify) now sets $hostResult.Error so the host shows as
-                failed (red) in the console and HTML report
-        3.7.3 - Before cert regen, compare ESXi configured hostname (via
-                Get-VMHostNetwork) to the FQDN from the hosts file; if they
-                differ, skip regen and flag as CN mismatch immediately --
-                generate-certificates uses the host's own hostname so regen
-                would produce the same wrong CN and the reboot is wasted
-        3.7.2 - CN mismatch after cert regen now marks the host as not ready:
-                red in the console summary table, red in the HTML report,
-                and overall row status set to warn so the host is not shown
-                as successful (VCF will not accept a mismatched CN)
-        3.7.1 - After cert regen and reboot, re-check CN vs FQDN; if still
-                mismatched set CertRegen to "CN mismatch" with a WARN log
-                entry and highlight it in red in the HTML report
         3.7.0 - Replaced Start/Stop-Transcript with Write-Log: timestamped
                 INFO/WARN/ERROR entries written to the log file; all
                 Write-Host and Write-Warning calls converted to Write-Log;
                 log file defaults to script directory (same as report and
                 CSV); -NoNewline console-only calls produce no log entry
+        3.7.1 - After cert regen and reboot, re-check CN vs FQDN; if still
+                mismatched set CertRegen to "CN mismatch" with a WARN log
+                entry and highlight it in red in the HTML report
+        3.7.2 - CN mismatch after cert regen now marks the host as not ready:
+                red in the console summary table, red in the HTML report,
+                and overall row status set to warn so the host is not shown
+                as successful (VCF will not accept a mismatched CN)
+        3.7.3 - Before cert regen, compare ESXi configured hostname (via
+                Get-VMHostNetwork) to the FQDN from the hosts file; if they
+                differ, skip regen and flag as CN mismatch immediately --
+                generate-certificates uses the host's own hostname so regen
+                would produce the same wrong CN and the reboot is wasted
+        3.7.4 - CN mismatch (both pre-regen hostname check and post-regen
+                verify) now sets $hostResult.Error so the host shows as
+                failed (red) in the console and HTML report
         4.0.0 - Added -WipeDisk switch and Invoke-VSANDiskWipe helper:
                 enumerates non-boot disks with existing partitions via
                 esxcli, prompts Y/N per host, wipes partition tables via
@@ -258,6 +258,36 @@
                 falls back to manual SSH instructions when Posh-SSH is
                 unavailable; DiskWipe column added to summary table and
                 HTML report; Get-CellColor updated to match Skipped*
+        4.0.1 - VMFS unmount in Invoke-VSANDiskWipe switched from PowerCLI
+                (Get-Datastore/Remove-Datastore) to SSH via esxcli storage
+                filesystem unmount; no vCenter connection required; SSH
+                session opened before unmount and reused for the wipe
+        4.0.2 - All Write-Host/Write-Warning calls in Invoke-VSANDiskWipe
+                converted to Write-Log; per-device partition count logged
+                during enumeration; VMFS extent matches logged per disk;
+                full wipe flow now captured in the log file
+        4.0.3 - Fixed boot disk size heuristic: esxcli returns Size as a
+                string; cast to [long] before -le comparison to prevent
+                lexicographic false-positives (e.g. "512000" -le "8192"
+                evaluated true)
+        4.0.4 - Replaced size heuristic with layered boot detection: Layer 2
+                (system.boot.device.get), Layer 3 (IsRemovable fallback);
+                warning logged if boot device cannot be identified
+        4.0.5 - Added Layer 2b (system.coredump.partition.get) and Layer 2c
+                (OSDATA-* VMFS volume -- always present on ESXi boot disk,
+                no SSH required); added Layer 4 SSH /proc/mounts probe
+                inside the wipe session as a final safety net
+        4.0.6 - Layer 4 /proc/mounts retroactively removes boot disk from
+                wipe candidate list if missed by Layers 1-3; aborts cleanly
+                if no candidates remain after removal
+        4.0.7 - Fixed Layer 4 SSH command: replaced awk (broken PowerShell
+                string escaping) with grep ' /bootbank ' /proc/mounts
+        4.0.8 - Fixed VMFS unmount command: corrected namespace from
+                esxcli storage vmfs unmount to esxcli storage filesystem
+                unmount -l <label>
+        4.0.9 - Removed diagnostic/debug logging from Invoke-VSANDiskWipe;
+                boot detection layers log only on success or actionable
+                warning; VMFS unmount list logged once at collection time
 #>
 
 [CmdletBinding()]
@@ -293,10 +323,10 @@ param (
 
 $ScriptMeta = @{
     Name    = "HostPrep.ps1"
-    Version = "4.0.0"
+    Version = "4.0.9"
     Author  = "Paul van Dieen"
     Blog    = "https://www.hollebollevsan.nl"
-    Date    = "2026-03-23"
+    Date    = "2026-04-05"
 }
 
 #endregion
@@ -1009,7 +1039,8 @@ function Invoke-VSANDiskWipe {
           and excludes it unconditionally
         - Lists non-boot disks that have existing partition tables
         - Prompts Y/N before wiping
-        - Unmounts any VMFS datastores on target disks before wiping
+        - Unmounts any VMFS datastores on target disks via SSH (esxcli storage vmfs unmount)
+          before wiping -- no vCenter connection required
         - Wipes partition tables via SSH using: partedUtil mklabel <device> gpt
         - Falls back to printing manual SSH instructions if Posh-SSH is unavailable
 
@@ -1045,10 +1076,9 @@ function Invoke-VSANDiskWipe {
     try {
         $allDevices = $esxCli.storage.core.device.list.Invoke()
     } catch {
-        Write-Warning "  Could not enumerate storage devices: $_"
+        Write-Log ("  Could not enumerate storage devices: {0}" -f $_) -Level WARN
         return [PSCustomObject]@{ Status = "FAILED: $_"; WipedCount = 0; FailedDisks = @() }
     }
-
     # --- Identify boot device(s) ---
     $bootDevices = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
 
@@ -1059,19 +1089,67 @@ function Invoke-VSANDiskWipe {
         }
     }
 
-    # Layer 2: Size heuristic fallback -- USB/SD boot media is typically <= 8 GB.
-    # Only used when Layer 1 found nothing (e.g. older ESXi or flag not set).
+    # Layer 2a: esxcli system boot device get
     if ($bootDevices.Count -eq 0) {
-        Write-Host "  IsBootDrive flag not set -- using size heuristic (<=8 GB) for boot disk detection." -ForegroundColor DarkGray
+        try {
+            $bootDevInfo = $esxCli.system.boot.device.get.Invoke()
+            $rawPath = $bootDevInfo.PSObject.Properties |
+                Where-Object { $_.Value -match '/dev/disks/|vmhba|eui\.' } |
+                Select-Object -First 1 -ExpandProperty Value
+            if ($rawPath) {
+                $devName = ($rawPath -replace '^/dev/disks/', '') -replace ':\d+$', ''
+                if ($devName) {
+                    $bootDevices.Add($devName) | Out-Null
+                    Write-Log ("  Boot device identified (system.boot.device.get): {0}" -f $devName) -Color DarkGray
+                }
+            }
+        } catch { }
+    }
+
+    # Layer 2b: esxcli system coredump partition get
+    if ($bootDevices.Count -eq 0) {
+        try {
+            $cdump = $esxCli.system.coredump.partition.get.Invoke()
+            $cdumpRaw = $cdump.PSObject.Properties |
+                Where-Object { $_.Value -match 'vmhba|eui\.' } |
+                Select-Object -First 1 -ExpandProperty Value
+            if ($cdumpRaw) {
+                $devName = $cdumpRaw -replace ':\d+$', ''
+                if ($devName) {
+                    $bootDevices.Add($devName) | Out-Null
+                    Write-Log ("  Boot device identified (coredump partition): {0}" -f $devName) -Color DarkGray
+                }
+            }
+        } catch { }
+    }
+
+    # Layer 2c: OSDATA volume detection -- ESXi boot disks always host an OSDATA-* VMFS volume.
+    if ($bootDevices.Count -eq 0) {
+        try {
+            $allExtents = $esxCli.storage.vmfs.extent.list.Invoke()
+            foreach ($extent in ($allExtents | Where-Object { $_.VolumeName -like 'OSDATA-*' })) {
+                $bootDevices.Add($extent.DeviceName) | Out-Null
+                Write-Log ("  Boot device identified (OSDATA volume): {0}" -f $extent.DeviceName) -Color DarkGray
+            }
+        } catch { }
+    }
+
+    # Layer 3: Removable device fallback -- catches USB/SD/CD-ROM boot media.
+    if ($bootDevices.Count -eq 0) {
+        Write-Log "  Boot device not identified via esxcli -- falling back to IsRemovable flag." -Level WARN
         foreach ($dev in $allDevices) {
-            if ($dev.Size -le 8192) {   # Size is in MB; 8192 MB = 8 GB
+            if ($dev.IsRemovable -eq $true) {
                 $bootDevices.Add($dev.Device) | Out-Null
             }
         }
     }
 
+    if ($bootDevices.Count -eq 0) {
+        Write-Log "  WARNING: Could not identify boot device -- all non-boot disks will be candidates. Review carefully." -Level WARN
+    }
+
     $bootDeviceList = if ($bootDevices.Count -gt 0) { ($bootDevices | Sort-Object) -join ', ' } else { 'none detected' }
-    Write-Host ("  Boot device(s) excluded from wipe: {0}" -f $bootDeviceList) -ForegroundColor DarkGray
+    Write-Log ("  Boot device(s) excluded from wipe: {0}" -f $bootDeviceList) -Color DarkGray
 
     # --- Find non-boot disks with existing partition tables ---
     $disksToWipe = [System.Collections.Generic.List[PSCustomObject]]::new()
@@ -1083,8 +1161,9 @@ function Invoke-VSANDiskWipe {
             $partArgs = $esxCli.storage.core.device.partition.list.CreateArgs()
             $partArgs.device = $dev.Device
             $partitions = $esxCli.storage.core.device.partition.list.Invoke($partArgs)
+            $partCount  = @($partitions).Count
 
-            if ($partitions -and @($partitions).Count -gt 0) {
+            if ($partitions -and $partCount -gt 0) {
                 $sizeGb = [math]::Round($dev.Size / 1024, 1)
                 $disksToWipe.Add([PSCustomObject]@{
                     Device  = $dev.Device
@@ -1094,26 +1173,26 @@ function Invoke-VSANDiskWipe {
                 })
             }
         } catch {
-            # Device has no partition table or partition query unsupported -- skip
+            Write-Log ("  Device {0} -- partition query failed (skipped): {1}" -f $dev.Device, $_) -Color DarkGray
         }
     }
 
     if ($disksToWipe.Count -eq 0) {
-        Write-Host "  All non-boot disks are clean. No wipe needed." -ForegroundColor Green
+        Write-Log "  All non-boot disks are clean. No wipe needed." -Color Green
         return [PSCustomObject]@{ Status = "Skipped (clean)"; WipedCount = 0; FailedDisks = @() }
     }
 
     # --- Display disks and prompt ---
-    Write-Host ""
-    Write-Host ("  Disks with existing partitions on {0}:" -f $VMHost) -ForegroundColor Yellow
+    Write-Log ""
+    Write-Log ("  Disks with existing partitions on {0}:" -f $VMHost) -Level WARN
     foreach ($disk in $disksToWipe) {
-        Write-Host ("    {0}  ({1} GB, SSD: {2})" -f $disk.Device, $disk.SizeGB, $disk.IsSSD) -ForegroundColor Yellow
-        Write-Host ("      {0}" -f $disk.Display) -ForegroundColor DarkGray
+        Write-Log ("    {0}  ({1} GB, SSD: {2})" -f $disk.Device, $disk.SizeGB, $disk.IsSSD) -Level WARN
+        Write-Log ("      {0}" -f $disk.Display) -Color DarkGray
     }
-    Write-Host ""
+    Write-Log ""
 
     if ($DryRun) {
-        Write-Host ("  [DRY RUN] Would wipe {0} disk(s) on {1}." -f $disksToWipe.Count, $VMHost) -ForegroundColor DarkYellow
+        Write-Log ("  [DRY RUN] Would wipe {0} disk(s) on {1}." -f $disksToWipe.Count, $VMHost) -Color DarkYellow
         return [PSCustomObject]@{ Status = "OK"; WipedCount = $disksToWipe.Count; FailedDisks = @() }
     }
 
@@ -1121,22 +1200,22 @@ function Invoke-VSANDiskWipe {
     while ($answer -notin @('Y', 'N')) {
         $answer = (Read-Host ("  Wipe {0} disk(s) on {1}? [Y/N]" -f $disksToWipe.Count, $VMHost)).Trim().ToUpper()
         if ($answer -notin @('Y', 'N')) {
-            Write-Host "  Please enter Y or N." -ForegroundColor Yellow
+            Write-Log "  Please enter Y or N." -Level WARN
         }
     }
 
     if ($answer -eq 'N') {
-        Write-Host "  Disk wipe skipped by operator." -ForegroundColor DarkGray
+        Write-Log "  Disk wipe skipped by operator." -Color DarkGray
         return [PSCustomObject]@{ Status = "Skipped (operator)"; WipedCount = 0; FailedDisks = @() }
     }
 
     # --- Posh-SSH availability check (soft fail) ---
     if (-not $script:PoshSSHAvailable) {
-        Write-Host ""
-        Write-Host "  Posh-SSH not available. Cannot run partedUtil via SSH." -ForegroundColor Yellow
-        Write-Host "  ACTION REQUIRED: Manually wipe the following disks on ${VMHost} via SSH:" -ForegroundColor Yellow
+        Write-Log ""
+        Write-Log "  Posh-SSH not available. Cannot run partedUtil via SSH." -Level WARN
+        Write-Log ("  ACTION REQUIRED: Manually wipe the following disks on {0} via SSH:" -f $VMHost) -Level WARN
         foreach ($disk in $disksToWipe) {
-            Write-Host ("    partedUtil mklabel /vmfs/devices/disks/{0} gpt" -f $disk.Device) -ForegroundColor Cyan
+            Write-Log ("    partedUtil mklabel /vmfs/devices/disks/{0} gpt" -f $disk.Device) -Color Cyan
         }
         return [PSCustomObject]@{
             Status      = "Manual"
@@ -1145,27 +1224,24 @@ function Invoke-VSANDiskWipe {
         }
     }
 
-    # --- Unmount any VMFS datastores on the target disks before wiping ---
+    # --- Collect VMFS volumes mounted on target disks (via esxcli -- no vCenter needed) ---
+    $vmfsToUnmount = [System.Collections.Generic.List[string]]::new()
     try {
         $vmfsExtents = $esxCli.storage.vmfs.extent.list.Invoke()
         foreach ($disk in $disksToWipe) {
-            $extents = $vmfsExtents | Where-Object { $_.DeviceName -eq $disk.Device }
-            foreach ($extent in $extents) {
-                $dsName = $extent.VolumeName
-                $ds = Get-Datastore -VMHost $VMHostObj -Name $dsName -ErrorAction SilentlyContinue
-                if ($ds) {
-                    Write-Host ("  Unmounting VMFS datastore '{0}' from {1}..." -f $dsName, $disk.Device) -ForegroundColor Yellow
-                    Remove-Datastore -Datastore $ds -VMHost $VMHostObj -Confirm:$false -ErrorAction SilentlyContinue
-                    Write-Host ("  Datastore '{0}' removed." -f $dsName) -ForegroundColor Green
+            foreach ($extent in ($vmfsExtents | Where-Object { $_.DeviceName -eq $disk.Device })) {
+                if (-not $vmfsToUnmount.Contains($extent.VolumeName)) {
+                    $vmfsToUnmount.Add($extent.VolumeName)
+                    Write-Log ("  VMFS datastore to unmount: '{0}' on {1}" -f $extent.VolumeName, $disk.Device) -Color DarkGray
                 }
             }
         }
     } catch {
-        Write-Warning "  VMFS extent check failed (non-fatal): $_"
+        Write-Log ("  VMFS extent check failed (non-fatal): {0}" -f $_) -Level WARN
     }
 
-    # --- Enable SSH temporarily and wipe ---
-    Write-Host "  Enabling SSH temporarily for disk wipe..." -ForegroundColor Yellow
+    # --- Enable SSH temporarily, then unmount VMFS and wipe in one session ---
+    Write-Log "  Enabling SSH temporarily for disk wipe..." -Level WARN
     Set-VMHostServiceConfig -VMHost $VMHostObj -ServiceKey "TSM-SSH"
 
     $wipedCount = 0
@@ -1173,31 +1249,66 @@ function Invoke-VSANDiskWipe {
     $sshSession  = $null
 
     try {
-        Write-Host "  Connecting via SSH to run partedUtil..." -ForegroundColor Cyan
+        Write-Log "  Connecting via SSH to run partedUtil..." -Color Cyan
         $sshSession = New-SSHSession -ComputerName $VMHost -Credential $Credential -AcceptKey -ErrorAction Stop
+
+        # Layer 4: /proc/mounts bootbank check -- definitive boot device identification via SSH.
+        # Runs after session is open; retroactively removes boot disk from wipe list if it was
+        # missed by Layers 1-3 (e.g. nested ESXi where IsBootDrive flag is not set).
+        $mountResult = Invoke-SSHCommand -SessionId $sshSession.SessionId `
+            -Command "grep ' /bootbank ' /proc/mounts" -ErrorAction SilentlyContinue
+        $bootMountRaw = ($mountResult.Output | Where-Object { $_ -match '/dev/disks/' } | Select-Object -First 1)
+        if ($bootMountRaw) {
+            $bootMountRaw = ($bootMountRaw.Trim() -split '\s+')[0]   # first field = device path
+            $bootDevFromMount = ($bootMountRaw -replace '^/dev/disks/', '') -replace ':\d+$', ''
+            if ($bootDevFromMount -and -not $bootDevices.Contains($bootDevFromMount)) {
+                Write-Log ("  Boot device '{0}' was not excluded by earlier layers -- removing from wipe list." -f $bootDevFromMount) -Level WARN
+                $bootDevices.Add($bootDevFromMount) | Out-Null
+                $disksToWipe = [System.Collections.Generic.List[PSCustomObject]]($disksToWipe | Where-Object { $_.Device -ne $bootDevFromMount })
+                if ($disksToWipe.Count -eq 0) {
+                    Write-Log "  No wipe candidates remain after boot device removal. Skipping wipe." -Color Green
+                    return [PSCustomObject]@{ Status = "Skipped (clean)"; WipedCount = 0; FailedDisks = @() }
+                }
+                Write-Log ("  Remaining wipe candidates: {0}" -f ($disksToWipe | ForEach-Object { $_.Device }) -join ', ') -Color DarkGray
+            }
+        }
+
+        # Unmount VMFS volumes via SSH before wiping
+        foreach ($volName in $vmfsToUnmount) {
+            Write-Log ("  Unmounting VMFS datastore '{0}'..." -f $volName) -Level WARN
+            $umResult = Invoke-SSHCommand -SessionId $sshSession.SessionId `
+                -Command ("esxcli storage filesystem unmount -l '{0}'" -f $volName) `
+                -ErrorAction SilentlyContinue
+            if ($umResult.ExitStatus -eq 0) {
+                Write-Log ("  Datastore '{0}' unmounted." -f $volName) -Color Green
+            } else {
+                $umErr = ($umResult.Output -join ' ').Trim()
+                Write-Log ("  Could not unmount '{0}' (wipe may fail): {1}" -f $volName, $umErr) -Level WARN
+            }
+        }
 
         foreach ($disk in $disksToWipe) {
             try {
-                Write-Host ("  Wiping {0} ({1} GB)..." -f $disk.Device, $disk.SizeGB) -ForegroundColor Yellow
+                Write-Log ("  Wiping {0} ({1} GB)..." -f $disk.Device, $disk.SizeGB) -Level WARN
                 $cmd    = "partedUtil mklabel /vmfs/devices/disks/{0} gpt" -f $disk.Device
                 $result = Invoke-SSHCommand -SessionId $sshSession.SessionId -Command $cmd -ErrorAction Stop
 
                 if ($result.ExitStatus -eq 0) {
-                    Write-Host ("  Wiped {0} successfully." -f $disk.Device) -ForegroundColor Green
+                    Write-Log ("  Wiped {0} successfully." -f $disk.Device) -Color Green
                     $wipedCount++
                 } else {
                     $errMsg = ($result.Output -join ' ').Trim()
-                    Write-Warning ("  partedUtil failed on {0}: {1}" -f $disk.Device, $errMsg)
+                    Write-Log ("  partedUtil failed on {0}: {1}" -f $disk.Device, $errMsg) -Level WARN
                     $failedDisks.Add($disk.Device)
                 }
             } catch {
-                Write-Warning ("  Failed to wipe {0}: {1}" -f $disk.Device, $_)
+                Write-Log ("  Failed to wipe {0}: {1}" -f $disk.Device, $_) -Level WARN
                 $failedDisks.Add($disk.Device)
             }
         }
 
     } catch {
-        Write-Warning "  SSH connection failed: $_"
+        Write-Log ("  SSH connection failed: {0}" -f $_) -Level WARN
         return [PSCustomObject]@{
             Status      = "FAILED: SSH - $_"
             WipedCount  = 0
@@ -1207,13 +1318,13 @@ function Invoke-VSANDiskWipe {
         if ($sshSession) {
             Remove-SSHSession -SessionId $sshSession.SessionId -ErrorAction SilentlyContinue | Out-Null
         }
-        Write-Host "  Disabling SSH..." -ForegroundColor Yellow
+        Write-Log "  Disabling SSH..." -Level WARN
         $svc = Get-VMHostService -VMHost $VMHostObj | Where-Object { $_.Key -eq "TSM-SSH" }
         if ($svc) {
             $svc | Set-VMHostService -Policy "off" -Confirm:$false | Out-Null
             if ($svc.Running) { $svc | Stop-VMHostService -Confirm:$false | Out-Null }
         }
-        Write-Host "  SSH disabled." -ForegroundColor Green
+        Write-Log "  SSH disabled." -Color Green
     }
 
     $status = if ($failedDisks.Count -eq 0) {
@@ -1225,7 +1336,7 @@ function Invoke-VSANDiskWipe {
     }
 
     $statusColor = if ($status -eq 'OK') { 'Green' } elseif ($status -eq 'Partial') { 'Yellow' } else { 'Red' }
-    Write-Host ("  Disk wipe complete: {0} wiped, {1} failed." -f $wipedCount, $failedDisks.Count) -ForegroundColor $statusColor
+    Write-Log ("  Disk wipe complete: {0} wiped, {1} failed." -f $wipedCount, $failedDisks.Count) -Color $statusColor
 
     return [PSCustomObject]@{
         Status      = $status
