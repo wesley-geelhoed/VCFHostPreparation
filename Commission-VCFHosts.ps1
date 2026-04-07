@@ -242,6 +242,8 @@
         3.1.3 - Added maintenance mode check before validation: queries each
                 host via ESXi SOAP API; if any are in maintenance mode the
                 user is prompted to exit maintenance mode before proceeding
+        3.1.4 - Added copy-to-clipboard button next to each SDDC Manager
+                Host ID in the commissioning HTML report
 #>
 
 [CmdletBinding()]
@@ -278,7 +280,7 @@ param (
 
 $ScriptMeta = @{
     Name    = "Commission-VCFHosts.ps1"
-    Version = "3.1.3"
+    Version = "3.1.4"
     Author  = "Paul van Dieen"
     Blog    = "https://www.hollebollevsan.nl"
     Date    = "2026-03-20"
@@ -1005,7 +1007,8 @@ function Write-CommissionReport {
         $hostIdDisplay = if ($row.HostID -eq "N/A") {
             "<span style='color:#6e7681;font-style:italic'>N/A</span>"
         } else {
-            "<code style='font-size:0.75rem;color:#79c0ff'>$([System.Web.HttpUtility]::HtmlEncode($row.HostID))</code>"
+            $encodedId = [System.Web.HttpUtility]::HtmlEncode($row.HostID)
+            "<code style='font-size:0.75rem;color:#79c0ff'>$encodedId</code><button class='copy-btn' onclick=""copyHostId(this,'$encodedId')"" title='Copy to clipboard'>&#128203;</button>"
         }
         "
         <tr class='$rowClass'>
@@ -1049,6 +1052,8 @@ function Write-CommissionReport {
   tr.warn td:first-child { border-left: 3px solid #d29922; }
   .note { margin-top: 20px; font-size: 0.8rem; color: #8b949e; background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 12px 16px; }
   .note strong { color: #c9d1d9; }
+  .copy-btn { background: none; border: 1px solid #30363d; border-radius: 4px; color: #8b949e; cursor: pointer; font-size: 0.7rem; padding: 1px 5px; margin-left: 6px; vertical-align: middle; transition: all 0.15s; }
+  .copy-btn:hover { background: #1f2937; color: #c9d1d9; border-color: #58a6ff; }
   footer { margin-top: 28px; font-size: 0.75rem; color: #6e7681; text-align: center; }
 </style>
 </head>
@@ -1109,6 +1114,16 @@ function Write-CommissionReport {
 
 <footer>Commission-VCFHosts.ps1 v$ScriptVersion &bull; <a href="https://www.hollebollevsan.nl" style="color:#58a6ff;text-decoration:none">Paul van Dieen &bull; HolleBollevSAN</a></footer>
 
+<script>
+function copyHostId(btn, text) {
+  navigator.clipboard.writeText(text).then(function() {
+    var orig = btn.innerHTML;
+    btn.innerHTML = '&#10003;';
+    btn.style.color = '#3fb950';
+    setTimeout(function() { btn.innerHTML = orig; btn.style.color = ''; }, 1500);
+  });
+}
+</script>
 </body>
 </html>
 "@

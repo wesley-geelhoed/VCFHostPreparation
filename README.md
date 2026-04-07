@@ -5,7 +5,7 @@ Two PowerShell scripts that automate ESXi host preparation and commissioning for
 | Script | Version | Purpose |
 |---|---|---|
 | `HostPrep.ps1` | 4.0.9 | Prepares ESXi hosts — DNS, NTP, certificates, storage detection, disk wipe, advanced settings, password reset |
-| `Commission-VCFHosts.ps1` | 3.1.3 | Commissions prepared hosts into SDDC Manager via the REST API |
+| `Commission-VCFHosts.ps1` | 3.1.4 | Commissions prepared hosts into SDDC Manager via the REST API |
 
 Run `HostPrep.ps1` first, then hand the generated CSV to `Commission-VCFHosts.ps1`.
 
@@ -183,7 +183,7 @@ Reads the CSV produced by `HostPrep.ps1` and commissions all hosts into SDDC Man
 10. Polls the task every 15 seconds until `SUCCESSFUL`, `FAILED`, or timeout
 11. Queries `GET /v1/hosts` to retrieve the SDDC Manager host UUID per commissioned host
 12. Prints a colourised per-host summary table with host UUIDs
-13. Writes a dark-mode HTML commissioning report and results CSV; opens the report in the browser
+13. Writes a dark-mode HTML commissioning report and results CSV; opens the report in the browser — each host UUID has a **copy-to-clipboard button** for quick access
 
 ### Storage type
 
