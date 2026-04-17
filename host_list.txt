@@ -1,1 +1,4 @@
+vcf-rd01-mgmt01-esx01.copaco.dev
 vcf-rd01-mgmt01-esx02.copaco.dev
+vcf-rd01-mgmt01-esx03.copaco.dev
+vcf-rd01-mgmt01-esx04.copaco.dev
