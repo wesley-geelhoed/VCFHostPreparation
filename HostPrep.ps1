@@ -292,7 +292,7 @@
 
 [CmdletBinding()]
 param (
-    [string[]]$NtpServers = @("pool.ntp.org"),
+    [string[]]$NtpServers = @("192.168.77.201"),
 
     [switch]$DryRun,
 
