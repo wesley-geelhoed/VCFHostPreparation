@@ -290,7 +290,7 @@
                 warning; VMFS unmount list logged once at collection time
 #>
 
-Get-SSHTrustedHost | Remove-SSHTrustedHost -Force -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
+
 
 [CmdletBinding()]
 param (
