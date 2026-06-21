@@ -290,6 +290,8 @@
                 warning; VMFS unmount list logged once at collection time
 #>
 
+Get-SSHTrustedHost | Remove-SSHTrustedHost -Force -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
+
 [CmdletBinding()]
 param (
     [string[]]$NtpServers = @("192.168.77.201"),
