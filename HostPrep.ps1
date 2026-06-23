@@ -709,6 +709,8 @@ function Invoke-ESXiCertificateRegen {
     # Enable SSH temporarily
     Write-Log "  Enabling SSH temporarily for certificate regeneration..." -Level WARN
     Set-VMHostServiceConfig -VMHost $VMHostObj -ServiceKey "TSM-SSH"
+    Get-SSHTrustedHost | Remove-SSHTrustedHost 
+    
 
     $sshSession = $null
     try {
