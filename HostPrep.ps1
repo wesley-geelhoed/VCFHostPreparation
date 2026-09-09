@@ -294,7 +294,7 @@
 
 [CmdletBinding()]
 param (
-    [string[]]$NtpServers = @("192.168.77.201"),
+    [string[]]$NtpServers = @("10.100.0.254"),
 
     [switch]$DryRun,
 
